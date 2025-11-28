@@ -1,10 +1,9 @@
 import type { FC } from 'react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import 'react-pdf-highlighter/dist/style.css'
 import { PdfHighlighter, PdfLoader, Highlight } from 'react-pdf-highlighter'
 import type { IHighlight, ScaledPosition } from 'react-pdf-highlighter'
 import Loading from '@/app/components/base/loading'
-import { noop } from 'lodash-es'
 
 type PdfViewerWithHighlightProps = {
   url: string
@@ -27,11 +26,51 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
   onFullTextExtracted,
 }) => {
   const [highlights, setHighlights] = useState<IHighlight[]>([])
+  const [isScalingDone, setIsScalingDone] = useState(false)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const lastSizeRef = useRef({ width: 0, height: 0 })
+  const stabilityTimerRef = useRef<NodeJS.Timeout | null>(null)
 
+  // Watch for container size to stabilize (scaling complete)
   useEffect(() => {
+    if (!containerRef.current) return
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0]
+      if (!entry) return
+
+      const { width, height } = entry.contentRect
+
+      if (stabilityTimerRef.current)
+        clearTimeout(stabilityTimerRef.current)
+
+      if (width !== lastSizeRef.current.width || height !== lastSizeRef.current.height) {
+        lastSizeRef.current = { width, height }
+
+        // Wait 300ms after last resize to consider scaling done
+        stabilityTimerRef.current = setTimeout(() => {
+          setIsScalingDone(true)
+          observer.disconnect()
+        }, 300)
+      }
+    })
+
+    observer.observe(containerRef.current)
+
+    return () => {
+      observer.disconnect()
+      if (stabilityTimerRef.current)
+        clearTimeout(stabilityTimerRef.current)
+    }
+  }, [])
+
+  // Apply highlights only after scaling is done
+  useEffect(() => {
+    if (!isScalingDone || !searchText) return
+
     const findTextHighlight = async () => {
       try {
-        if (!searchText || highlights.length > 0) return
+        if (highlights.length > 0) return
 
         const pageNum = pageNumber ? Number.parseInt(pageNumber) : 1
         const page = await pdfDocument.getPage(pageNum)
@@ -115,24 +154,17 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
           textPositions.forEach((pos) => {
             const posEnd = pos.index + pos.text.length + 1
 
-            // Check if this text item is within our highlight range
             if (pos.index >= chunkStartIndex && posEnd <= chunkEndIndex) {
-              const [scaleX, , , scaleY, x, y] = pos.transform
+              const [, , , scaleY, x, y] = pos.transform
               const height = pos.height || Math.abs(scaleY)
               const width = pos.width
 
-              // Use PDF coordinates with baseline adjustment
               const yOffset = height * 0.15
-              const x1 = x
-              const y1 = y - yOffset
-              const x2 = x + width
-              const y2 = y + height - yOffset
-
               matchedRects.push({
-                x1,
-                y1,
-                x2,
-                y2,
+                x1: x,
+                y1: y - yOffset,
+                x2: x + width,
+                y2: y + height - yOffset,
                 width,
                 height,
                 pageNumber: pageNum,
@@ -173,28 +205,28 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
     }
 
     findTextHighlight()
-  }, [pdfDocument, searchText, pageNumber, highlights.length, onFullTextExtracted])
+  }, [pdfDocument, searchText, pageNumber, highlights.length, onFullTextExtracted, isScalingDone])
 
   return (
-    <PdfHighlighter
-      pdfDocument={pdfDocument}
-      enableAreaSelection={() => false}
-      scrollRef={noop}
-      onScrollChange={noop}
-      pdfScaleValue="1"
-      onSelectionFinished={() => null}
-      highlightTransform={(highlight, index, setTip, hideTip, viewportToScaled, screenshot, isScrolledTo) => {
-        return (
+    <div ref={containerRef} className='h-full w-full'>
+      <PdfHighlighter
+        pdfDocument={pdfDocument}
+        enableAreaSelection={() => false}
+        scrollRef={() => {}}
+        onScrollChange={() => {}}
+        pdfScaleValue="page-width"
+        onSelectionFinished={() => null}
+        highlightTransform={(highlight, _index, _setTip, _hideTip, _viewportToScaled, _screenshot, isScrolledTo) => (
           <Highlight
-            key={index}
+            key={highlight.id}
             isScrolledTo={isScrolledTo}
             position={highlight.position}
             comment={highlight.comment}
           />
-        )
-      }}
-      highlights={highlights}
-    />
+        )}
+        highlights={highlights}
+      />
+    </div>
   )
 }
 
@@ -215,7 +247,7 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
           </div>
         }
       >
-        {(pdfDocument) => (
+        {pdfDocument => (
           <PdfHighlighterWrapper
             pdfDocument={pdfDocument}
             searchText={searchText}
