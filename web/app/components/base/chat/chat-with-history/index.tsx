@@ -234,6 +234,11 @@ const ChatWithHistoryWrap: FC<ChatWithHistoryWrapProps> = ({
     initUserVariables,
   } = useChatWithHistory(installedAppInfo)
 
+  // Close file preview when switching conversations
+  useEffect(() => {
+    setPreviewData(null)
+  }, [currentConversationId])
+
   return (
     <ChatWithHistoryContext.Provider value={{
       appData,
