@@ -137,6 +137,7 @@ const Header = () => {
           {currentConversationId && inputsForms.length > 0 && (
             <ViewFormDropdown />
           )}
+          {/* Custom Panel Toggle */}
         </div>
       </div>
       {!!showConfirm && (

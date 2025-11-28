@@ -60,6 +60,9 @@ export type ChatWithHistoryContextValue = {
     name?: string
     avatar_url?: string
   }
+  // File preview panel state
+  previewData: { url: string; sourceText?: string; pageNumber?: string; filename?: string; chunkId?: string } | null
+  setPreviewData: (data: { url: string; sourceText?: string; pageNumber?: string; filename?: string; chunkId?: string } | null) => void
 }
 
 export const ChatWithHistoryContext = createContext<ChatWithHistoryContextValue>({
@@ -95,5 +98,7 @@ export const ChatWithHistoryContext = createContext<ChatWithHistoryContextValue>
   setCurrentConversationInputs: noop,
   allInputsHidden: false,
   initUserVariables: {},
+  previewData: null,
+  setPreviewData: noop,
 })
 export const useChatWithHistoryContext = () => useContext(ChatWithHistoryContext)

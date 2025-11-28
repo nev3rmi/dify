@@ -19,6 +19,7 @@ import Loading from '@/app/components/base/loading'
 import useBreakpoints, { MediaType } from '@/hooks/use-breakpoints'
 import cn from '@/utils/classnames'
 import useDocumentTitle from '@/hooks/use-document-title'
+import PdfViewerWithHighlight from './pdf-viewer-with-highlight'
 
 type ChatWithHistoryProps = {
   className?: string
@@ -33,6 +34,8 @@ const ChatWithHistory: FC<ChatWithHistoryProps> = ({
     isMobile,
     themeBuilder,
     sidebarCollapseState,
+    previewData,
+    setPreviewData,
   } = useChatWithHistoryContext()
   const isSidebarCollapsed = sidebarCollapseState
   const customConfig = appData?.custom_config
@@ -91,6 +94,86 @@ const ChatWithHistory: FC<ChatWithHistoryProps> = ({
           )}
         </div>
       </div>
+      {!isMobile && previewData && (
+        <div className='flex w-[400px] flex-col p-1 pl-0 transition-all duration-200 ease-in-out'>
+          <div className='flex h-full w-full flex-col rounded-xl border-[0.5px] border-components-panel-border-subtle bg-components-panel-bg shadow-lg'>
+            {/* Header */}
+            <div className='flex h-12 shrink-0 items-center justify-between border-b border-components-panel-border-subtle px-4'>
+              <span className='system-md-semibold truncate text-text-secondary'>
+                File Preview
+              </span>
+              <div className='flex items-center gap-1'>
+                <a
+                  href={previewData.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className='flex h-8 w-8 items-center justify-center rounded-lg hover:bg-state-base-hover'
+                  title="Open in new tab"
+                >
+                  <svg className='h-4 w-4' fill='none' stroke='currentColor' viewBox='0 0 24 24'>
+                    <path strokeLinecap='round' strokeLinejoin='round' strokeWidth={2} d='M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14' />
+                  </svg>
+                </a>
+                <button
+                  onClick={() => setPreviewData(null)}
+                  className='flex h-8 w-8 items-center justify-center rounded-lg hover:bg-state-base-hover'
+                  title="Close"
+                >
+                  <svg className='h-4 w-4' fill='none' stroke='currentColor' viewBox='0 0 24 24'>
+                    <path strokeLinecap='round' strokeLinejoin='round' strokeWidth={2} d='M6 18L18 6M6 6l12 12' />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            {/* Content */}
+            <div className='flex-1 overflow-auto p-4'>
+              {/* File info */}
+              {previewData.filename && (
+                <div className='mb-2 text-xs font-medium text-text-secondary'>
+                  File Name: {previewData.filename}
+                </div>
+              )}
+              {(previewData.pageNumber || previewData.chunkId) && (
+                <div className='mb-3 text-xs text-text-tertiary'>
+                  {previewData.pageNumber && <span>Page {previewData.pageNumber}</span>}
+                  {previewData.pageNumber && previewData.chunkId && <span> - </span>}
+                  {previewData.chunkId && <span>Chunk {previewData.chunkId}</span>}
+                </div>
+              )}
+              {/* Source text citation */}
+              {(previewData.fullText || previewData.sourceText) && (
+                <div className='bg-background-default-dimm mb-4 rounded-lg border border-divider-subtle p-3'>
+                  <div className='mb-2 text-xs font-medium text-text-tertiary'>Source Text</div>
+                  <div className='text-sm text-text-secondary'>
+                    {previewData.fullText || previewData.sourceText}
+                  </div>
+                </div>
+              )}
+              {/* Image preview */}
+              {/\.(png|jpg|jpeg|gif|webp|svg)$/i.test(previewData.url) && (
+                <img
+                  src={previewData.url}
+                  alt="Preview"
+                  className='max-w-full rounded-lg'
+                />
+              )}
+              {/* PDF preview with highlighting */}
+              {/\.pdf$/i.test(previewData.url) && (
+                <div className='relative h-full min-h-[600px] w-full overflow-hidden rounded-lg'>
+                  <PdfViewerWithHighlight
+                    url={previewData.url}
+                    searchText={previewData.sourceText}
+                    pageNumber={previewData.pageNumber}
+                    onFullTextExtracted={(fullText) => {
+                      setPreviewData(prev => prev ? { ...prev, fullText } : null)
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -106,6 +189,7 @@ const ChatWithHistoryWrap: FC<ChatWithHistoryWrapProps> = ({
   const media = useBreakpoints()
   const isMobile = media === MediaType.mobile
   const themeBuilder = useThemeContext()
+  const [previewData, setPreviewData] = useState<{ url: string; sourceText?: string; pageNumber?: string; filename?: string; chunkId?: string; fullText?: string } | null>(null)
 
   const {
     appData,
@@ -188,6 +272,8 @@ const ChatWithHistoryWrap: FC<ChatWithHistoryWrapProps> = ({
       setCurrentConversationInputs,
       allInputsHidden,
       initUserVariables,
+      previewData,
+      setPreviewData,
     }}>
       <ChatWithHistory className={className} />
     </ChatWithHistoryContext.Provider>
