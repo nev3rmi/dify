@@ -34,11 +34,14 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
   const [isScalingDone, setIsScalingDone] = useState(false)
   const [isViewerReady, setIsViewerReady] = useState(false)
   const [fullChunkContext, setFullChunkContext] = useState<string | null>(null)
+  const [apiPageNumber, setApiPageNumber] = useState<number | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const lastSizeRef = useRef({ width: 0, height: 0 })
   const stabilityTimerRef = useRef<NodeJS.Timeout | null>(null)
   const viewerReadyTimerRef = useRef<NodeJS.Timeout | null>(null)
   const isFirstLoadRef = useRef(true)
+  const scrollToFnRef = useRef<((highlight: IHighlight) => void) | null>(null)
+  const hasScrolledRef = useRef(false)
 
   // Similarity score function (0-1, where 1 is exact match)
   const calculateSimilarity = (str1: string, str2: string): number => {
@@ -75,9 +78,11 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
     addLog('🔄 Citation changed, clearing highlights...')
     setHighlights([])
     setFullChunkContext(null)
+    setApiPageNumber(null)
     setIsScalingDone(false)
     setIsViewerReady(false)
     isFirstLoadRef.current = true // Treat as first load for new citation
+    hasScrolledRef.current = false // Allow scroll for new citation
 
     // Clear any pending timers
     if (viewerReadyTimerRef.current) {
@@ -109,6 +114,12 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
         }
         else {
           addLog('❌ No chunk_context in response')
+        }
+
+        // Get page number from API response
+        if (data.page_numbers && data.page_numbers.length > 0) {
+          setApiPageNumber(data.page_numbers[0])
+          addLog(`📄 API page number: ${data.page_numbers[0]}`)
         }
       }
       catch (error: any) {
@@ -193,7 +204,8 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
         addLog('🚀 Starting text extraction...')
         addLog(`🔍 Using: ${fullChunkContext ? 'Full chunk context' : 'Search text'}`)
 
-        const pageNum = pageNumber ? Number.parseInt(pageNumber) : 1
+        // Priority: apiPageNumber > pageNumber prop > default 1
+        const pageNum = apiPageNumber || (pageNumber ? Number.parseInt(pageNumber) : 1)
         const page = await pdfDocument.getPage(pageNum)
         const viewport = page.getViewport({ scale: 1.0 })
 
@@ -489,7 +501,24 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
     }
 
     findTextHighlight()
-  }, [pdfDocument, searchText, pageNumber, isScalingDone, fullChunkContext, calculateSimilarity])
+  }, [pdfDocument, searchText, pageNumber, isScalingDone, fullChunkContext, apiPageNumber, calculateSimilarity])
+
+  // Scroll to highlight when viewer is ready and highlights are set
+  useEffect(() => {
+    if (!isViewerReady || highlights.length === 0 || hasScrolledRef.current)
+      return
+
+    // Small delay to ensure the highlight is rendered
+    const scrollTimer = setTimeout(() => {
+      if (scrollToFnRef.current && highlights[0]) {
+        addLog('📜 Scrolling to highlight...')
+        scrollToFnRef.current(highlights[0])
+        hasScrolledRef.current = true
+      }
+    }, 100)
+
+    return () => clearTimeout(scrollTimer)
+  }, [isViewerReady, highlights])
 
   return (
     <div className='flex h-full w-full flex-col'>
@@ -512,8 +541,9 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
         <PdfHighlighter
           pdfDocument={pdfDocument}
           enableAreaSelection={() => false}
-          // eslint-disable-next-line no-empty-function
-          scrollRef={() => {}}
+          scrollRef={(scrollTo) => {
+            scrollToFnRef.current = scrollTo
+          }}
           // eslint-disable-next-line no-empty-function
           onScrollChange={() => {}}
           pdfScaleValue="page-width"
