@@ -9,6 +9,7 @@ type PdfViewerWithHighlightProps = {
   url: string
   searchText?: string
   pageNumber?: string
+  chunkId?: string
   onFullTextExtracted?: (fullText: string) => void
 }
 
@@ -16,24 +17,68 @@ type PdfHighlighterWrapperProps = {
   pdfDocument: any
   searchText?: string
   pageNumber?: string
+  chunkId?: string
   onFullTextExtracted?: (fullText: string) => void
 }
+
+const CHUNK_API_URL = 'https://n8n.toho.vn/webhook/dbf0d2ae-ec68-4827-bdb7-f5dec29c2b1d'
 
 const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
   pdfDocument,
   searchText,
   pageNumber,
+  chunkId,
   onFullTextExtracted,
 }) => {
   const [highlights, setHighlights] = useState<IHighlight[]>([])
   const [isScalingDone, setIsScalingDone] = useState(false)
+  const [debugLog, setDebugLog] = useState<string[]>([])
+  const [fullChunkContext, setFullChunkContext] = useState<string | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const lastSizeRef = useRef({ width: 0, height: 0 })
   const stabilityTimerRef = useRef<NodeJS.Timeout | null>(null)
 
+  const addLog = (msg: string) => setDebugLog(prev => [...prev, `${new Date().toLocaleTimeString()} - ${msg}`])
+
+  // Fetch full chunk context from API
+  useEffect(() => {
+    if (!chunkId) {
+      addLog('⚠️ No chunkId provided')
+      return
+    }
+
+    const fetchChunkContext = async () => {
+      try {
+        addLog(`📡 Fetching chunk ${chunkId}...`)
+        const response = await fetch(`${CHUNK_API_URL}?chunkID=${chunkId}`)
+        const data = await response.json()
+
+        if (data.chunk_context) {
+          setFullChunkContext(data.chunk_context)
+          addLog(`✅ Got chunk: "${data.chunk_context.substring(0, 50)}..."`)
+
+          // Notify parent with the full text from API
+          if (onFullTextExtracted) {
+            onFullTextExtracted(data.chunk_context)
+          }
+        }
+        else {
+          addLog('❌ No chunk_context in response')
+        }
+      }
+      catch (error: any) {
+        addLog(`❌ API error: ${error.message}`)
+      }
+    }
+
+    fetchChunkContext()
+  }, [chunkId, onFullTextExtracted])
+
   // Watch for container size to stabilize (scaling complete)
   useEffect(() => {
     if (!containerRef.current) return
+
+    addLog('👀 Watching for scaling...')
 
     const observer = new ResizeObserver((entries) => {
       const entry = entries[0]
@@ -46,9 +91,11 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
 
       if (width !== lastSizeRef.current.width || height !== lastSizeRef.current.height) {
         lastSizeRef.current = { width, height }
+        addLog(`📐 Size: ${width.toFixed(0)}x${height.toFixed(0)}`)
 
         // Wait 300ms after last resize to consider scaling done
         stabilityTimerRef.current = setTimeout(() => {
+          addLog('✅ Scaling complete!')
           setIsScalingDone(true)
           observer.disconnect()
         }, 300)
@@ -64,13 +111,18 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
     }
   }, [])
 
-  // Apply highlights only after scaling is done
+  // Apply highlights only after scaling is done AND we have context
   useEffect(() => {
-    if (!isScalingDone || !searchText) return
+    // Use fullChunkContext if available, otherwise fall back to searchText
+    const textToSearch = fullChunkContext || searchText
+    if (!isScalingDone || !textToSearch) return
 
     const findTextHighlight = async () => {
       try {
         if (highlights.length > 0) return
+
+        addLog('🚀 Starting text extraction...')
+        addLog(`🔍 Using: ${fullChunkContext ? 'Full chunk context' : 'Search text'}`)
 
         const pageNum = pageNumber ? Number.parseInt(pageNumber) : 1
         const page = await pdfDocument.getPage(pageNum)
@@ -78,6 +130,7 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
 
         const textContent = await page.getTextContent()
         const items = textContent.items as any[]
+        addLog(`📄 Page ${pageNum}: ${items.length} text items`)
 
         // Build full text and track positions
         let fullText = ''
@@ -102,43 +155,52 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
           }
         })
 
-        // Normalize text for better matching
+        // Simple normalize - just lowercase and normalize spaces
         const normalizeText = (text: string) => text
-          .replace(/['']/g, '\'')
-          .replace(/[""]/g, '"')
+          .toLowerCase()
           .replace(/\s+/g, ' ')
           .trim()
 
         const normalizedFullText = normalizeText(fullText)
+        addLog(`📝 PDF: "${fullText.substring(0, 60)}..."`)
 
-        // Handle truncated format "ABC ... XYZ"
-        let fullChunkText = searchText
-        let searchStartText = searchText
-        let searchEndText = searchText
+        // Use first 4-6 words from the context/search text
+        const searchQuery = textToSearch.split('...')[0]?.trim() || textToSearch
+        const searchWords = normalizeText(searchQuery).split(' ').slice(0, 6).join(' ')
+        addLog(`🔎 Searching: "${searchWords.substring(0, 50)}..."`)
 
-        if (searchText.includes('...')) {
-          const parts = searchText.split('...')
-          const startWords = parts[0]?.trim().split(' ').slice(0, 7).join(' ') || ''
-          const endWords = parts[parts.length - 1]?.trim() || ''
-          searchStartText = normalizeText(startWords)
-          searchEndText = normalizeText(endWords)
+        // Find start in PDF
+        let chunkStartIndex = normalizedFullText.indexOf(searchWords)
 
-          const startIndex = normalizedFullText.indexOf(searchStartText)
-          const endIndex = normalizedFullText.indexOf(searchEndText, startIndex)
-
-          if (startIndex !== -1 && endIndex !== -1)
-            fullChunkText = fullText.substring(startIndex, endIndex + searchEndText.length).trim()
+        // Fallback: try fewer words
+        if (chunkStartIndex === -1) {
+          const fewerWords = normalizeText(searchQuery).split(' ').slice(0, 3).join(' ')
+          chunkStartIndex = normalizedFullText.indexOf(fewerWords)
+          if (chunkStartIndex !== -1) {
+            addLog(`🔄 Fallback matched with 3 words`)
+          }
         }
 
-        // Notify parent of full extracted text
-        if (onFullTextExtracted)
-          onFullTextExtracted(fullChunkText)
+        // Find end using last words of context
+        let chunkEndIndex = -1
+        if (chunkStartIndex !== -1) {
+          const endWords = normalizeText(textToSearch).split(' ').slice(-4).join(' ')
+          const endIdx = normalizedFullText.indexOf(endWords, chunkStartIndex)
 
-        // Find text positions for highlighting
-        const normalizedSearchStart = normalizeText(searchStartText)
-        const normalizedSearchEnd = normalizeText(searchEndText)
-        const chunkStartIndex = normalizedFullText.indexOf(normalizedSearchStart)
-        const chunkEndIndex = normalizedFullText.indexOf(normalizedSearchEnd, chunkStartIndex) + normalizedSearchEnd.length
+          if (endIdx !== -1) {
+            chunkEndIndex = endIdx + endWords.length
+          }
+          else {
+            // Default: use length of search text or 300 chars
+            chunkEndIndex = chunkStartIndex + Math.min(textToSearch.length, 500)
+          }
+          addLog(`✅ Found at ${chunkStartIndex}-${chunkEndIndex}`)
+        }
+        else {
+          addLog(`❌ Text not found in PDF`)
+        }
+
+        // Note: Full text is now fetched from API and sent via onFullTextExtracted there
 
         if (chunkStartIndex !== -1 && chunkEndIndex > chunkStartIndex) {
           const matchedRects: Array<{
@@ -172,6 +234,8 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
             }
           })
 
+          addLog(`📦 Found ${matchedRects.length} rects`)
+
           if (matchedRects.length > 0) {
             const boundingRect = {
               x1: Math.min(...matchedRects.map(r => r.x1)),
@@ -196,36 +260,60 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
             }
 
             setHighlights([newHighlight])
+            addLog('🎉 Highlight applied!')
+          }
+          else {
+            addLog('❌ No rects to highlight')
           }
         }
+        else {
+          addLog('❌ Text not found in PDF')
+        }
       }
-      catch (error) {
+      catch (error: any) {
         console.error('Error finding highlights:', error)
+        addLog(`❌ Error: ${error.message}`)
       }
     }
 
     findTextHighlight()
-  }, [pdfDocument, searchText, pageNumber, highlights.length, onFullTextExtracted, isScalingDone])
+  }, [pdfDocument, searchText, pageNumber, highlights.length, onFullTextExtracted, isScalingDone, fullChunkContext])
 
   return (
-    <div ref={containerRef} className='h-full w-full'>
-      <PdfHighlighter
-        pdfDocument={pdfDocument}
-        enableAreaSelection={() => false}
-        scrollRef={() => {}}
-        onScrollChange={() => {}}
-        pdfScaleValue="page-width"
-        onSelectionFinished={() => null}
-        highlightTransform={(highlight, _index, _setTip, _hideTip, _viewportToScaled, _screenshot, isScrolledTo) => (
-          <Highlight
-            key={highlight.id}
-            isScrolledTo={isScrolledTo}
-            position={highlight.position}
-            comment={highlight.comment}
-          />
-        )}
-        highlights={highlights}
-      />
+    <div className='flex h-full w-full flex-col'>
+      {/* Debug Panel */}
+      <div className='shrink-0 border-b border-gray-200 bg-gray-50 p-2'>
+        <div className='flex items-center gap-2 text-xs'>
+          <span className='font-medium'>Debug:</span>
+          <span>Scaling: {isScalingDone ? '✅' : '⏳'}</span>
+          <span>Highlights: {highlights.length}</span>
+        </div>
+        <div className='mt-1 max-h-20 overflow-y-auto rounded border border-gray-200 bg-white p-1 font-mono text-xs'>
+          {debugLog.map((log, i) => (
+            <div key={i} className='text-gray-600'>{log}</div>
+          ))}
+        </div>
+      </div>
+      {/* PDF Viewer */}
+      <div ref={containerRef} className='min-h-0 flex-1'>
+        <PdfHighlighter
+          pdfDocument={pdfDocument}
+          enableAreaSelection={() => false}
+          scrollRef={() => {}}
+          onScrollChange={() => {}}
+          pdfScaleValue="page-width"
+          onSelectionFinished={() => null}
+          highlightTransform={(highlight, _index, _setTip, _hideTip, _viewportToScaled, _screenshot, isScrolledTo) => (
+            <Highlight
+              key={highlight.id}
+              isScrolledTo={isScrolledTo}
+              position={highlight.position}
+              comment={highlight.comment}
+            />
+          )}
+          highlights={highlights}
+        />
+      </div>
     </div>
   )
 }
@@ -234,6 +322,7 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
   url,
   searchText,
   pageNumber,
+  chunkId,
   onFullTextExtracted,
 }) => {
   return (
@@ -252,6 +341,7 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
             pdfDocument={pdfDocument}
             searchText={searchText}
             pageNumber={pageNumber}
+            chunkId={chunkId}
             onFullTextExtracted={onFullTextExtracted}
           />
         )}
