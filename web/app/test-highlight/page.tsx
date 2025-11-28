@@ -1,25 +1,71 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import 'react-pdf-highlighter/dist/style.css'
 import { PdfHighlighter, PdfLoader, Highlight } from 'react-pdf-highlighter'
 import type { IHighlight, ScaledPosition } from 'react-pdf-highlighter'
-import { noop } from 'lodash-es'
 
-const PdfHighlighterWrapper = ({ pdfDocument, pdfUrl }: { pdfDocument: any, pdfUrl: string }) => {
+const PdfHighlighterWrapper = ({ pdfDocument }: { pdfDocument: any }) => {
   const [highlights, setHighlights] = useState<IHighlight[]>([])
   const [debugLog, setDebugLog] = useState<string[]>([])
+  const [isScalingDone, setIsScalingDone] = useState(false)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const lastSizeRef = useRef({ width: 0, height: 0 })
+  const stabilityTimerRef = useRef<NodeJS.Timeout | null>(null)
   const searchText = 'Science News Article'
 
   const addLog = (msg: string) => setDebugLog(prev => [...prev, `${new Date().toLocaleTimeString()} - ${msg}`])
 
+  // Watch for container size to stabilize (scaling complete)
   useEffect(() => {
+    if (!containerRef.current) return
+
+    addLog('👀 Watching for scaling to complete...')
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0]
+      if (!entry) return
+
+      const { width, height } = entry.contentRect
+
+      // Clear previous timer
+      if (stabilityTimerRef.current) {
+        clearTimeout(stabilityTimerRef.current)
+      }
+
+      // Check if size changed
+      if (width !== lastSizeRef.current.width || height !== lastSizeRef.current.height) {
+        lastSizeRef.current = { width, height }
+        addLog(`📐 Size changed: ${width.toFixed(0)}x${height.toFixed(0)}`)
+
+        // Wait 300ms after last resize to consider scaling done
+        stabilityTimerRef.current = setTimeout(() => {
+          addLog('✅ Scaling complete!')
+          setIsScalingDone(true)
+          observer.disconnect()
+        }, 300)
+      }
+    })
+
+    observer.observe(containerRef.current)
+
+    return () => {
+      observer.disconnect()
+      if (stabilityTimerRef.current) {
+        clearTimeout(stabilityTimerRef.current)
+      }
+    }
+  }, [])
+
+  // Apply highlights only after scaling is done
+  useEffect(() => {
+    if (!isScalingDone) return
+
     const findTextHighlight = async () => {
       try {
-        if (highlights.length > 0) return // Already found
+        if (highlights.length > 0) return
 
         addLog('🚀 Starting PDF text extraction...')
-        console.log('🔍 Searching for:', searchText)
 
         const page = await pdfDocument.getPage(1)
         const viewport = page.getViewport({ scale: 1.0 })
@@ -28,53 +74,37 @@ const PdfHighlighterWrapper = ({ pdfDocument, pdfUrl }: { pdfDocument: any, pdfU
         const items = textContent.items as any[]
         addLog(`Page 1 loaded. Found ${items.length} text items.`)
 
-        // Normalize search text
         const normalize = (s: string) => s.replace(/\s+/g, ' ').toLowerCase()
         const searchNormalized = normalize(searchText)
 
-        const matchedRects: Array<{ x1: number, y1: number, x2: number, y2: number, width: number, height: number, pageNumber: number }> = []
+        const matchedRects: Array<{ x1: number; y1: number; x2: number; y2: number; width: number; height: number; pageNumber: number }> = []
 
-        // Find items that match - looking for exact phrase match
         items.forEach((item: any) => {
           const itemStr = item.str.trim()
           if (!itemStr) return
 
-          const itemNormalized = normalize(itemStr)
-
-          // Only match if this item contains the COMPLETE search phrase
-          if (itemNormalized === searchNormalized) {
+          if (normalize(itemStr) === searchNormalized) {
             addLog(`Exact match found: "${item.str}"`)
-            const [scaleX, , , scaleY, x, y] = item.transform
+            const [, , , scaleY, x, y] = item.transform
 
-            // Use scaleY (font size) for height if item.height is not reliable
             const height = item.height || Math.abs(scaleY)
             const width = item.width
 
-            // react-pdf-highlighter expects PDF coordinates at scale 1.0
-            // Adjust y down by adding an offset (text baseline adjustment)
             const yOffset = height * 0.15
-            const x1 = x
-            const y1 = y - yOffset
-            const x2 = x + width
-            const y2 = y + height - yOffset
-
-            addLog(`PDF Coords: x1=${x1.toFixed(2)}, y1=${y1.toFixed(2)}, x2=${x2.toFixed(2)}, y2=${y2.toFixed(2)}`)
-
             matchedRects.push({
-              x1,
-              y1,
-              x2,
-              y2,
+              x1: x,
+              y1: y - yOffset,
+              x2: x + width,
+              y2: y + height - yOffset,
               width,
               height,
-              pageNumber: 1
+              pageNumber: 1,
             })
           }
         })
 
         if (matchedRects.length > 0) {
-          addLog(`✅ Found ${matchedRects.length} matching rectangles. Creating highlight.`)
-          console.log('✅ Found matches:', matchedRects)
+          addLog(`✅ Found ${matchedRects.length} rectangles. Creating highlight...`)
 
           const boundingRect = {
             x1: Math.min(...matchedRects.map(r => r.x1)),
@@ -92,64 +122,58 @@ const PdfHighlighterWrapper = ({ pdfDocument, pdfUrl }: { pdfDocument: any, pdfU
               boundingRect,
               rects: matchedRects,
               pageNumber: 1,
-              usePdfCoordinates: true,  // Tell the library we're using PDF coordinates!
+              usePdfCoordinates: true,
             } as ScaledPosition,
             content: { text: searchText },
             comment: { text: 'Auto-found', emoji: '🤖' },
           }
 
           setHighlights([newHighlight])
-        } else {
-          addLog('❌ No matches found for search text.')
+          addLog('🎉 Highlight applied!')
         }
-      } catch (error: any) {
-        console.error('Error finding highlights:', error)
+        else {
+          addLog('❌ No matches found.')
+        }
+      }
+      catch (error: any) {
+        console.error('Error:', error)
         addLog(`❌ Error: ${error.message}`)
       }
     }
 
     findTextHighlight()
-  }, [pdfDocument, searchText, highlights.length])
+  }, [pdfDocument, isScalingDone, highlights.length])
 
   return (
     <div className='flex h-full flex-col'>
       <div className='mb-4 rounded bg-gray-100 p-4'>
         <h1 className='mb-2 text-2xl font-bold'>PDF Highlighting Test</h1>
-        <p>Testing react-pdf-highlighter@8.0.0-rc.0</p>
-        <p>Searching and highlighting text: <strong>"{searchText}"</strong></p>
-        <div className='mt-2 max-h-32 overflow-y-auto rounded border border-gray-300 bg-white p-2 text-xs font-mono'>
+        <p>Searching: <strong>&quot;{searchText}&quot;</strong></p>
+        <p className='text-sm text-gray-600'>
+          Scaling: {isScalingDone ? '✅ Done' : '⏳ In progress...'} | Highlights: {highlights.length}
+        </p>
+        <div className='mt-2 max-h-32 overflow-y-auto rounded border border-gray-300 bg-white p-2 font-mono text-xs'>
           {debugLog.map((log, i) => (
             <div key={i}>{log}</div>
           ))}
         </div>
       </div>
-      <div className='relative flex-1 border border-gray-300'>
+      <div ref={containerRef} className='relative flex-1 border border-gray-300'>
         <PdfHighlighter
           pdfDocument={pdfDocument}
-          enableAreaSelection={(event) => event.altKey}
-          scrollRef={noop}
-          onScrollChange={noop}
-          pdfScaleValue="1"
-          onSelectionFinished={(position, content, hideTipAndSelection, transformSelection) => {
-            console.log('Selection made:', position)
-            return (
-              <Highlight
-                isScrolledTo={false}
-                position={position}
-                comment={{ text: 'New selection', emoji: '' }}
-              />
-            )
-          }}
-          highlightTransform={(highlight, index, setTip, hideTip, viewportToScaled, screenshot, isScrolledTo) => {
-            return (
-              <Highlight
-                key={index}
-                isScrolledTo={isScrolledTo}
-                position={highlight.position}
-                comment={highlight.comment}
-              />
-            )
-          }}
+          enableAreaSelection={event => event.altKey}
+          scrollRef={() => {}}
+          onScrollChange={() => {}}
+          pdfScaleValue="page-width"
+          onSelectionFinished={() => null}
+          highlightTransform={(highlight, _index, _setTip, _hideTip, _viewportToScaled, _screenshot, isScrolledTo) => (
+            <Highlight
+              key={highlight.id}
+              isScrolledTo={isScrolledTo}
+              position={highlight.position}
+              comment={highlight.comment}
+            />
+          )}
           highlights={highlights}
         />
       </div>
@@ -168,9 +192,7 @@ export default function TestHighlightPage() {
           workerSrc='/pdf.worker.min.mjs'
           beforeLoad={<div className='flex h-64 items-center justify-center'>Loading PDF...</div>}
         >
-          {(pdfDocument) => (
-            <PdfHighlighterWrapper pdfDocument={pdfDocument} pdfUrl={pdfUrl} />
-          )}
+          {pdfDocument => <PdfHighlighterWrapper pdfDocument={pdfDocument} />}
         </PdfLoader>
       </div>
     </div>
