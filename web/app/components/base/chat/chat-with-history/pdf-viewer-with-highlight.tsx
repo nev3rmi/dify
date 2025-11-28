@@ -32,10 +32,13 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
 }) => {
   const [highlights, setHighlights] = useState<IHighlight[]>([])
   const [isScalingDone, setIsScalingDone] = useState(false)
+  const [isViewerReady, setIsViewerReady] = useState(false)
   const [fullChunkContext, setFullChunkContext] = useState<string | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const lastSizeRef = useRef({ width: 0, height: 0 })
   const stabilityTimerRef = useRef<NodeJS.Timeout | null>(null)
+  const viewerReadyTimerRef = useRef<NodeJS.Timeout | null>(null)
+  const isFirstLoadRef = useRef(true)
 
   // Similarity score function (0-1, where 1 is exact match)
   const calculateSimilarity = (str1: string, str2: string): number => {
@@ -72,6 +75,15 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
     addLog('🔄 Citation changed, clearing highlights...')
     setHighlights([])
     setFullChunkContext(null)
+    setIsScalingDone(false)
+    setIsViewerReady(false)
+    isFirstLoadRef.current = true // Treat as first load for new citation
+
+    // Clear any pending timers
+    if (viewerReadyTimerRef.current) {
+      clearTimeout(viewerReadyTimerRef.current)
+      viewerReadyTimerRef.current = null
+    }
   }, [chunkId, pageNumber])
 
   // Fetch full chunk context from API
@@ -129,13 +141,30 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
         // Clear highlights during resize so they can be re-applied
         setHighlights([])
         setIsScalingDone(false)
+        setIsViewerReady(false)
 
-        // Wait 300ms after last resize to consider scaling done
+        // Clear any pending viewer ready timer
+        if (viewerReadyTimerRef.current) {
+          clearTimeout(viewerReadyTimerRef.current)
+          viewerReadyTimerRef.current = null
+        }
+
+        // Wait for size to stabilize
+        const scalingDelay = isFirstLoadRef.current ? 800 : 300
         stabilityTimerRef.current = setTimeout(() => {
           addLog('✅ Scaling complete!')
           setIsScalingDone(true)
+
+          // Wait additional time for PdfHighlighter viewer to fully initialize
+          // This prevents the "getPageView" crash on first click
+          const viewerDelay = isFirstLoadRef.current ? 600 : 200
+          viewerReadyTimerRef.current = setTimeout(() => {
+            addLog('✅ Viewer ready!')
+            setIsViewerReady(true)
+            isFirstLoadRef.current = false
+          }, viewerDelay)
           // Don't disconnect - keep watching for future resizes
-        }, 300)
+        }, scalingDelay)
       }
     })
 
@@ -145,6 +174,8 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
       observer.disconnect()
       if (stabilityTimerRef.current)
         clearTimeout(stabilityTimerRef.current)
+      if (viewerReadyTimerRef.current)
+        clearTimeout(viewerReadyTimerRef.current)
     }
   }, [])
 
@@ -170,34 +201,39 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
         const items = textContent.items as any[]
         addLog(`📄 Page ${pageNum}: ${items.length} text items`)
 
-        // Build full text and track positions
+        // Simple normalize - just lowercase and normalize spaces
+        const normalizeText = (text: string) => text
+          .toLowerCase()
+          .replace(/\s+/g, ' ')
+          .trim()
+
+        // Build full text and track positions (both raw and normalized indices)
         let fullText = ''
+        let normalizedText = ''
         const textPositions: Array<{
           text: string
           transform: number[]
           width: number
           height: number
           index: number
+          normalizedIndex: number
         }> = []
 
         items.forEach((item: any) => {
           if (item.str) {
+            const normalizedItem = normalizeText(item.str)
             textPositions.push({
               text: item.str,
               transform: item.transform,
               width: item.width,
               height: item.height,
               index: fullText.length,
+              normalizedIndex: normalizedText.length,
             })
             fullText += `${item.str} `
+            normalizedText += `${normalizedItem} `
           }
         })
-
-        // Simple normalize - just lowercase and normalize spaces
-        const normalizeText = (text: string) => text
-          .toLowerCase()
-          .replace(/\s+/g, ' ')
-          .trim()
 
         const normalizedFullText = normalizeText(fullText)
         addLog(`📝 PDF: "${fullText.substring(0, 60)}..."`)
@@ -320,11 +356,15 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
               if (anchorFound && Math.abs(posY - anchorY) > PROXIMITY_THRESHOLD)
                 continue
 
-              // Check if this text item overlaps with the sentence position
-              const posStart = pos.index
-              const posEnd = pos.index + pos.text.length
+              // Check if this text item overlaps with the sentence position (using normalized indices)
+              const posStart = pos.normalizedIndex
+              const posEnd = pos.normalizedIndex + normalizeText(pos.text).length + 1
 
-              if (posStart >= sentenceIndex && posEnd <= sentenceEnd + 5)
+              // Check for any overlap between text item and sentence range
+              // This captures items that: start within, end within, or span the range
+              const hasOverlap = posStart < sentenceEnd + 5 && posEnd > sentenceIndex - 2
+
+              if (hasOverlap)
                 addRect(pos, pageNum)
             }
           }
@@ -486,7 +526,7 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
               comment={highlight.comment}
             />
           )}
-          highlights={highlights}
+          highlights={isViewerReady ? highlights : []}
         />
       </div>
     </div>
