@@ -126,27 +126,18 @@ const ChatWithHistory: FC<ChatWithHistoryProps> = ({
               </div>
             </div>
             {/* Content */}
-            <div className='flex-1 overflow-hidden p-4'>
+            <div className='flex h-full flex-1 flex-col overflow-hidden p-4'>
               {/* File info */}
               {previewData.filename && (
-                <div className='mb-2 text-xs font-medium text-text-secondary'>
+                <div className='mb-1 shrink-0 text-xs font-medium text-text-secondary'>
                   File Name: {previewData.filename}
                 </div>
               )}
               {(previewData.pageNumber || previewData.chunkId) && (
-                <div className='mb-3 text-xs text-text-tertiary'>
+                <div className='mb-2 shrink-0 text-xs text-text-tertiary'>
                   {previewData.pageNumber && <span>Page {previewData.pageNumber}</span>}
                   {previewData.pageNumber && previewData.chunkId && <span> - </span>}
                   {previewData.chunkId && <span>Chunk {previewData.chunkId}</span>}
-                </div>
-              )}
-              {/* Source text citation */}
-              {(previewData.fullText || previewData.sourceText) && (
-                <div className='bg-background-default-dimm mb-4 rounded-lg border border-divider-subtle p-3'>
-                  <div className='mb-2 text-xs font-medium text-text-tertiary'>Source Text</div>
-                  <div className='text-sm text-text-secondary'>
-                    {previewData.fullText || previewData.sourceText}
-                  </div>
                 </div>
               )}
               {/* Image preview */}
@@ -159,12 +150,27 @@ const ChatWithHistory: FC<ChatWithHistoryProps> = ({
               )}
               {/* PDF preview with highlighting */}
               {/\.pdf(#|$)/i.test(previewData.url) && (
-                <div className='relative h-full min-h-[600px] w-full overflow-hidden rounded-lg'>
+                <div className='relative min-h-0 flex-1 overflow-hidden rounded-lg'>
                   <PdfViewerWithHighlight
                     url={previewData.url}
                     searchText={previewData.sourceText}
                     pageNumber={previewData.pageNumber}
+                    chunkId={previewData.chunkId}
+                    onFullTextExtracted={(text) => {
+                      if (text && text !== previewData.fullText) {
+                        setPreviewData(prev => prev ? { ...prev, fullText: text } : null)
+                      }
+                    }}
                   />
+                </div>
+              )}
+              {/* Source text citation - BELOW PDF */}
+              {(previewData.fullText || previewData.sourceText) && (
+                <div className='mt-3 shrink-0 rounded-lg border border-divider-subtle bg-gray-50 p-3'>
+                  <div className='mb-1 text-xs font-medium text-text-tertiary'>Source Text</div>
+                  <div className='max-h-32 overflow-y-auto text-xs text-text-secondary'>
+                    {previewData.fullText || previewData.sourceText}
+                  </div>
                 </div>
               )}
             </div>
