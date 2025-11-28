@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF Highlight Test</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: Arial, sans-serif;
+    }
+    #viewer {
+      width: 100%;
+      height: 800px;
+      border: 1px solid #ccc;
+    }
+    .info {
+      margin-bottom: 20px;
+      padding: 10px;
+      background: #f0f0f0;
+    }
+  </style>
+  <script src="https://unpkg.com/pdfjs-dist@4.4.168/build/pdf.min.mjs" type="module"></script>
+</head>
+<body>
+  <div class="info">
+    <h2>PDF Highlighting Test</h2>
+    <p>Testing if react-pdf-highlighter works with a simple highlight</p>
+  </div>
+
+  <div id="root"></div>
+
+  <script type="module">
+    import { createRoot } from 'https://esm.sh/react-dom@19.1.1/client';
+    import React from 'https://esm.sh/react@19.1.1';
+    import { PdfHighlighter, PdfLoader, Highlight } from 'https://esm.sh/react-pdf-highlighter@8.0.0-rc.0';
+
+    const App = () => {
+      const pdfUrl = 'https://minio.toho.vn/n8n-document-ingestion/tropical/inbox/Tropical.pdf';
+
+      // Test highlight
+      const testHighlights = [{
+        id: 'test-1',
+        position: {
+          boundingRect: { x1: 100, y1: 100, x2: 400, y2: 130, width: 800, height: 1000, pageNumber: 1 },
+          rects: [{ x1: 100, y1: 100, x2: 400, y2: 130, width: 300, height: 30, pageNumber: 1 }],
+          pageNumber: 1,
+        },
+        content: { text: 'Test highlight' },
+        comment: { text: 'This is a test', emoji: '' },
+      }];
+
+      return React.createElement('div', { style: { width: '100%', height: '800px' } },
+        React.createElement(PdfLoader, {
+          url: pdfUrl,
+          beforeLoad: React.createElement('div', null, 'Loading PDF...'),
+        }, (pdfDocument) => {
+          return React.createElement(PdfHighlighter, {
+            pdfDocument,
+            enableAreaSelection: () => false,
+            onScrollChange: () => {},
+            onSelectionFinished: () => null,
+            highlightTransform: (highlight, index) => {
+              return React.createElement(Highlight, {
+                key: index,
+                isScrolledTo: false,
+                position: highlight.position,
+                comment: highlight.comment,
+              });
+            },
+            highlights: testHighlights,
+          });
+        })
+      );
+    };
+
+    const root = createRoot(document.getElementById('root'));
+    root.render(React.createElement(App));
+  </script>
+</body>
+</html>
