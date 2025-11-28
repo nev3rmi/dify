@@ -106,6 +106,7 @@ const ChatWithHistoryWrap: FC<ChatWithHistoryWrapProps> = ({
   const media = useBreakpoints()
   const isMobile = media === MediaType.mobile
   const themeBuilder = useThemeContext()
+  const [previewData, setPreviewData] = useState<{ url: string; sourceText?: string } | null>(null)
 
   const {
     appData,
@@ -188,6 +189,8 @@ const ChatWithHistoryWrap: FC<ChatWithHistoryWrapProps> = ({
       setCurrentConversationInputs,
       allInputsHidden,
       initUserVariables,
+      previewData,
+      setPreviewData,
     }}>
       <ChatWithHistory className={className} />
     </ChatWithHistoryContext.Provider>

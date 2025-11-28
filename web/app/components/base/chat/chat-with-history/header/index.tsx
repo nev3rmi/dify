@@ -1,5 +1,6 @@
 import { useCallback, useState } from 'react'
 import {
+  RiCloseLine,
   RiEditBoxLine,
   RiLayoutRight2Line,
   RiResetLeftLine,
@@ -34,6 +35,8 @@ const Header = () => {
     sidebarCollapseState,
     handleSidebarCollapse,
     isResponding,
+    previewData,
+    setPreviewData,
   } = useChatWithHistoryContext()
   const { t } = useTranslation()
   const isSidebarCollapsed = sidebarCollapseState
@@ -42,6 +45,7 @@ const Header = () => {
 
   const [showConfirm, setShowConfirm] = useState<ConversationItem | null>(null)
   const [showRename, setShowRename] = useState<ConversationItem | null>(null)
+  const [showCustomPanel, setShowCustomPanel] = useState(false)
   const handleOperate = useCallback((type: string) => {
     if (type === 'pin')
       handlePinConversation(currentConversationId)
@@ -137,6 +141,16 @@ const Header = () => {
           {currentConversationId && inputsForms.length > 0 && (
             <ViewFormDropdown />
           )}
+          {/* Custom Panel Toggle */}
+          <Tooltip popupContent="Custom Panel">
+            <ActionButton
+              size='l'
+              state={showCustomPanel ? ActionButtonState.Active : ActionButtonState.Default}
+              onClick={() => setShowCustomPanel(!showCustomPanel)}
+            >
+              <RiLayoutRight2Line className='h-[18px] w-[18px]' />
+            </ActionButton>
+          </Tooltip>
         </div>
       </div>
       {!!showConfirm && (
@@ -156,6 +170,61 @@ const Header = () => {
           name={showRename?.name || ''}
           onSave={handleRename}
         />
+      )}
+      {/* File Preview Panel */}
+      {(showCustomPanel || previewData) && (
+        <div className='fixed right-0 top-14 z-50 flex h-[calc(100vh-56px)] w-[400px] flex-col border-l border-divider-subtle bg-background-default-subtle shadow-lg'>
+          <div className='flex h-12 shrink-0 items-center justify-between border-b border-divider-subtle px-4'>
+            <span className='system-md-semibold truncate text-text-secondary'>
+              {previewData ? 'File Preview' : 'Custom Panel'}
+            </span>
+            <ActionButton size='l' onClick={() => { setShowCustomPanel(false); setPreviewData(null) }}>
+              <RiCloseLine className='h-[18px] w-[18px]' />
+            </ActionButton>
+          </div>
+          <div className='flex-1 overflow-auto p-4'>
+            {previewData ? (
+              <>
+                {/* Source text citation */}
+                {previewData.sourceText && (
+                  <div className='mb-4 rounded-lg border border-divider-subtle bg-background-default-dimm p-3'>
+                    <div className='mb-2 text-xs font-medium text-text-tertiary'>Source Text</div>
+                    <div className='text-sm text-text-secondary'>{previewData.sourceText}</div>
+                  </div>
+                )}
+                {/* Image preview */}
+                {/\.(png|jpg|jpeg|gif|webp|svg)$/i.test(previewData.url) && (
+                  <img
+                    src={previewData.url}
+                    alt="Preview"
+                    className='max-w-full rounded-lg'
+                  />
+                )}
+                {/* PDF preview */}
+                {/\.pdf$/i.test(previewData.url) && (
+                  <iframe
+                    src={previewData.url}
+                    className='h-full min-h-[600px] w-full rounded-lg border-0'
+                    title="PDF Preview"
+                  />
+                )}
+                {/* Link to original */}
+                <a
+                  href={previewData.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className='mt-4 block text-sm text-text-accent underline'
+                >
+                  Open in new tab
+                </a>
+              </>
+            ) : (
+              <p className='text-sm text-text-tertiary'>
+                Click a minio.toho.vn link in chat to preview files here.
+              </p>
+            )}
+          </div>
+        </div>
       )}
     </>
   )
