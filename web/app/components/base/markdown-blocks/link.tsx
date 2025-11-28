@@ -26,15 +26,29 @@ const extractTextFromChildren = (children: React.ReactNode): string => {
   return ''
 }
 
-// Parse citation format: "Tropical.pdf - Page 3 - Chunk 47 - [Source text...]"
+// Parse citation format: "Tropical.pdf - Page 3 - Chunk 47 - [Source text...]" or "Tropical.pdf - Page 3 - Chunk 47 - Source text..."
 const parseCitation = (text: string) => {
-  const citationRegex = /^(.+?\.pdf)\s*-\s*Page\s*(\d+)\s*-\s*Chunk\s*(\d+)\s*-\s*\[(.+)\]$/i
-  const match = text.match(citationRegex)
+  // Try with brackets first
+  let citationRegex = /^(.+?\.pdf)\s*-\s*Page\s*(\d+)\s*-\s*Chunk\s*(\d+)\s*-\s*\[(.+)\]$/i
+  let match = text.match(citationRegex)
 
   if (match) {
     return {
       filename: match[1],
       pageNumber: match[2],
+      chunkId: match[3],
+      sourceText: match[4],
+    }
+  }
+
+  // Try without brackets
+  citationRegex = /^(.+?\.pdf)\s*-\s*Page\s*(\d+)\s*-\s*Chunk\s*(\d+)\s*-\s*(.+)$/i
+  match = text.match(citationRegex)
+
+  if (match) {
+    return {
+      filename: match[1],
+      pageNumber: match[2], // Already a string from regex match
       chunkId: match[3],
       sourceText: match[4],
     }
@@ -81,20 +95,24 @@ const Link = ({ node, children, ...props }: any) => {
 
         // Extract link text
         const linkText = extractTextFromChildren(children)
+        console.log('🔗 Link clicked, extracted text:', linkText)
 
         // Try to parse citation format
         const citation = parseCitation(linkText)
+        console.log('📋 Citation parsed:', citation)
 
         if (citation) {
           // Citation format detected - use page number and parsed source text
           const urlWithPage = `${href.toString()}#page=${citation.pageNumber}`
-          setPreviewData({
+          const previewDataObj = {
             url: urlWithPage,
             sourceText: citation.sourceText,
             pageNumber: citation.pageNumber,
             filename: citation.filename,
             chunkId: citation.chunkId,
-          })
+          }
+          console.log('✅ Setting previewData:', previewDataObj)
+          setPreviewData(previewDataObj)
         }
         else {
           // Fallback: use link text as source text
