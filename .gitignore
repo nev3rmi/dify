@@ -244,3 +244,21 @@ scripts/stress-test/reports/
 
 # settings
 *.local.json
+
+# Local development files
+docker/.env.dev
+docker/.env.dev.example
+docker/docker-compose.dev.yaml
+docker/dev/PLAN-*.md
+docker/dev/SETUP-*.md
+docker/dev/HOW-TO-*.md
+web/.env.local
+
+# Local development files
+docker/.env.dev
+docker/.env.dev.example
+docker/docker-compose.dev.yaml
+docker/dev/PLAN-*.md
+docker/dev/SETUP-*.md
+docker/dev/HOW-TO-*.md
+web/.env.local

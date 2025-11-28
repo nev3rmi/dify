@@ -1,0 +1,27 @@
+#!/bin/sh
+
+set -e
+
+cd /app/web
+
+# Export Next.js public environment variables
+export NEXT_PUBLIC_DEPLOY_ENV=${DEPLOY_ENV:-DEVELOPMENT}
+export NEXT_PUBLIC_EDITION=${EDITION:-SELF_HOSTED}
+export NEXT_PUBLIC_API_PREFIX=${NEXT_PUBLIC_API_PREFIX:-http://localhost:5001/console/api}
+export NEXT_PUBLIC_PUBLIC_API_PREFIX=${NEXT_PUBLIC_PUBLIC_API_PREFIX:-http://localhost:5001/api}
+export NEXT_PUBLIC_MARKETPLACE_API_PREFIX=${MARKETPLACE_API_URL:-}/api/v1
+export NEXT_PUBLIC_MARKETPLACE_URL_PREFIX=${MARKETPLACE_URL:-}
+export NEXT_PUBLIC_SENTRY_DSN=${SENTRY_DSN:-}
+export NEXT_PUBLIC_SITE_ABOUT=${SITE_ABOUT:-}
+
+# Feature flags
+export NEXT_PUBLIC_ENABLE_WEBSITE_JINAREADER=${ENABLE_WEBSITE_JINAREADER:-true}
+export NEXT_PUBLIC_ENABLE_WEBSITE_FIRECRAWL=${ENABLE_WEBSITE_FIRECRAWL:-true}
+export NEXT_PUBLIC_ENABLE_WEBSITE_WATERCRAWL=${ENABLE_WEBSITE_WATERCRAWL:-true}
+export NEXT_PUBLIC_ENABLE_SINGLE_DOLLAR_LATEX=${NEXT_PUBLIC_ENABLE_SINGLE_DOLLAR_LATEX:-false}
+
+echo "Starting Next.js development server with hot reload..."
+echo "API URL: ${NEXT_PUBLIC_API_PREFIX}"
+
+# Run Next.js dev server WITHOUT Turbopack (Turbopack slow in Docker+WSL)
+exec pnpm exec next dev --hostname 0.0.0.0 --port 3000
