@@ -1,7 +1,7 @@
 import type { FC } from 'react'
 import { useEffect, useState } from 'react'
 import 'react-pdf-highlighter/dist/style.css'
-import { PdfHighlighter, PdfLoader } from 'react-pdf-highlighter'
+import { PdfHighlighter, PdfLoader, Highlight } from 'react-pdf-highlighter'
 import type { IHighlight, ScaledPosition } from 'react-pdf-highlighter'
 import Loading from '@/app/components/base/loading'
 import { noop } from 'lodash-es'
@@ -13,45 +13,44 @@ type PdfViewerWithHighlightProps = {
   onFullTextExtracted?: (fullText: string) => void
 }
 
-const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
-  url,
+type PdfHighlighterWrapperProps = {
+  pdfDocument: any
+  searchText?: string
+  pageNumber?: string
+  onFullTextExtracted?: (fullText: string) => void
+}
+
+const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
+  pdfDocument,
   searchText,
   pageNumber,
   onFullTextExtracted,
 }) => {
   const [highlights, setHighlights] = useState<IHighlight[]>([])
 
-  // Extract text from PDF and create highlights
   useEffect(() => {
-    if (!searchText || !pageNumber)
-      return
-
-    const extractAndHighlight = async () => {
+    const findTextHighlight = async () => {
       try {
-        // Load PDF.js
-        const pdfjsLib = await import('pdfjs-dist')
-        pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs'
+        if (!searchText || highlights.length > 0) return
 
-        // Load PDF document
-        const loadingTask = pdfjsLib.getDocument(url)
-        const pdf = await loadingTask.promise
-
-        // Get the specific page
-        const pageNum = Number.parseInt(pageNumber)
-        const page = await pdf.getPage(pageNum)
-
-        // Get viewport for coordinate scaling
+        const pageNum = pageNumber ? Number.parseInt(pageNumber) : 1
+        const page = await pdfDocument.getPage(pageNum)
         const viewport = page.getViewport({ scale: 1.0 })
 
-        // Extract text content with positions
         const textContent = await page.getTextContent()
+        const items = textContent.items as any[]
 
         // Build full text and track positions
-        const items = textContent.items as any[]
         let fullText = ''
-        const textPositions: Array<{ text: string; transform: number[]; width: number; height: number; index: number }> = []
+        const textPositions: Array<{
+          text: string
+          transform: number[]
+          width: number
+          height: number
+          index: number
+        }> = []
 
-        items.forEach((item) => {
+        items.forEach((item: any) => {
           if (item.str) {
             textPositions.push({
               text: item.str,
@@ -64,19 +63,29 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
           }
         })
 
-        // Search for the chunk text
+        // Normalize text for better matching
+        const normalizeText = (text: string) => text
+          .replace(/['']/g, '\'')
+          .replace(/[""]/g, '"')
+          .replace(/\s+/g, ' ')
+          .trim()
+
+        const normalizedFullText = normalizeText(fullText)
+
+        // Handle truncated format "ABC ... XYZ"
         let fullChunkText = searchText
         let searchStartText = searchText
         let searchEndText = searchText
 
-        // Handle truncated format "ABC ... XYZ"
         if (searchText.includes('...')) {
           const parts = searchText.split('...')
-          searchStartText = parts[0]?.trim() || ''
-          searchEndText = parts[parts.length - 1]?.trim() || ''
+          const startWords = parts[0]?.trim().split(' ').slice(0, 7).join(' ') || ''
+          const endWords = parts[parts.length - 1]?.trim() || ''
+          searchStartText = normalizeText(startWords)
+          searchEndText = normalizeText(endWords)
 
-          const startIndex = fullText.indexOf(searchStartText)
-          const endIndex = fullText.indexOf(searchEndText, startIndex)
+          const startIndex = normalizedFullText.indexOf(searchStartText)
+          const endIndex = normalizedFullText.indexOf(searchEndText, startIndex)
 
           if (startIndex !== -1 && endIndex !== -1)
             fullChunkText = fullText.substring(startIndex, endIndex + searchEndText.length).trim()
@@ -87,72 +96,114 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
           onFullTextExtracted(fullChunkText)
 
         // Find text positions for highlighting
-        const chunkStartIndex = fullText.indexOf(searchStartText)
-        const chunkEndIndex = fullText.indexOf(searchEndText, chunkStartIndex) + searchEndText.length
+        const normalizedSearchStart = normalizeText(searchStartText)
+        const normalizedSearchEnd = normalizeText(searchEndText)
+        const chunkStartIndex = normalizedFullText.indexOf(normalizedSearchStart)
+        const chunkEndIndex = normalizedFullText.indexOf(normalizedSearchEnd, chunkStartIndex) + normalizedSearchEnd.length
 
         if (chunkStartIndex !== -1 && chunkEndIndex > chunkStartIndex) {
-          // Calculate bounding boxes for the matched text
-          const rects: Array<{ x1: number; y1: number; x2: number; y2: number; width: number; height: number; pageNumber: number }> = []
+          const matchedRects: Array<{
+            x1: number
+            y1: number
+            x2: number
+            y2: number
+            width: number
+            height: number
+            pageNumber: number
+          }> = []
 
           textPositions.forEach((pos) => {
             const posEnd = pos.index + pos.text.length + 1
 
             // Check if this text item is within our highlight range
             if (pos.index >= chunkStartIndex && posEnd <= chunkEndIndex) {
-              const [, , , , x, y] = pos.transform
+              const [scaleX, , , scaleY, x, y] = pos.transform
+              const height = pos.height || Math.abs(scaleY)
+              const width = pos.width
 
-              rects.push({
-                x1: x,
-                y1: viewport.height - y - pos.height,
-                x2: x + pos.width,
-                y2: viewport.height - y,
-                width: pos.width,
-                height: pos.height,
+              // Use PDF coordinates with baseline adjustment
+              const yOffset = height * 0.15
+              const x1 = x
+              const y1 = y - yOffset
+              const x2 = x + width
+              const y2 = y + height - yOffset
+
+              matchedRects.push({
+                x1,
+                y1,
+                x2,
+                y2,
+                width,
+                height,
                 pageNumber: pageNum,
               })
             }
           })
 
-          // Create highlight if we found rectangles
-          if (rects.length > 0) {
+          if (matchedRects.length > 0) {
             const boundingRect = {
-              x1: Math.min(...rects.map(r => r.x1)),
-              y1: Math.min(...rects.map(r => r.y1)),
-              x2: Math.max(...rects.map(r => r.x2)),
-              y2: Math.max(...rects.map(r => r.y2)),
+              x1: Math.min(...matchedRects.map(r => r.x1)),
+              y1: Math.min(...matchedRects.map(r => r.y1)),
+              x2: Math.max(...matchedRects.map(r => r.x2)),
+              y2: Math.max(...matchedRects.map(r => r.y2)),
               width: viewport.width,
               height: viewport.height,
               pageNumber: pageNum,
             }
 
-            const highlight: IHighlight = {
+            const newHighlight: IHighlight = {
               id: `highlight-${Date.now()}`,
               position: {
                 boundingRect,
-                rects,
+                rects: matchedRects,
                 pageNumber: pageNum,
+                usePdfCoordinates: true,
               } as ScaledPosition,
-              content: {
-                text: fullChunkText,
-              },
-              comment: {
-                text: '',
-                emoji: '',
-              },
+              content: { text: fullChunkText },
+              comment: { text: '', emoji: '' },
             }
 
-            setHighlights([highlight])
+            setHighlights([newHighlight])
           }
         }
       }
       catch (error) {
-        console.error('Error extracting PDF text:', error)
+        console.error('Error finding highlights:', error)
       }
     }
 
-    extractAndHighlight()
-  }, [url, searchText, pageNumber, onFullTextExtracted])
+    findTextHighlight()
+  }, [pdfDocument, searchText, pageNumber, highlights.length, onFullTextExtracted])
 
+  return (
+    <PdfHighlighter
+      pdfDocument={pdfDocument}
+      enableAreaSelection={() => false}
+      scrollRef={noop}
+      onScrollChange={noop}
+      pdfScaleValue="1"
+      onSelectionFinished={() => null}
+      highlightTransform={(highlight, index, setTip, hideTip, viewportToScaled, screenshot, isScrolledTo) => {
+        return (
+          <Highlight
+            key={index}
+            isScrolledTo={isScrolledTo}
+            position={highlight.position}
+            comment={highlight.comment}
+          />
+        )
+      }}
+      highlights={highlights}
+    />
+  )
+}
+
+const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
+  url,
+  searchText,
+  pageNumber,
+  onFullTextExtracted,
+}) => {
   return (
     <div className='h-full w-full'>
       <PdfLoader
@@ -164,28 +215,14 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
           </div>
         }
       >
-        {(pdfDocument) => {
-          return (
-            <PdfHighlighter
-              pdfDocument={pdfDocument}
-              enableAreaSelection={() => false}
-              scrollRef={noop}
-              onScrollChange={noop}
-              onSelectionFinished={() => null}
-              highlightTransform={() => {
-                return (
-                  <div
-                    className='absolute bg-yellow-200/40'
-                    style={{
-                      mixBlendMode: 'multiply',
-                    }}
-                  />
-                )
-              }}
-              highlights={highlights}
-            />
-          )
-        }}
+        {(pdfDocument) => (
+          <PdfHighlighterWrapper
+            pdfDocument={pdfDocument}
+            searchText={searchText}
+            pageNumber={pageNumber}
+            onFullTextExtracted={onFullTextExtracted}
+          />
+        )}
       </PdfLoader>
     </div>
   )

@@ -95,7 +95,7 @@ const ChatWithHistory: FC<ChatWithHistoryProps> = ({
         </div>
       </div>
       {!isMobile && previewData && (
-        <div className='flex w-[400px] flex-col p-1 pl-0 transition-all duration-200 ease-in-out'>
+        <div className='flex w-[400px] flex-col p-2 pl-0 transition-all duration-200 ease-in-out'>
           <div className='flex h-full w-full flex-col rounded-xl border-[0.5px] border-components-panel-border-subtle bg-components-panel-bg shadow-lg'>
             {/* Header */}
             <div className='flex h-12 shrink-0 items-center justify-between border-b border-components-panel-border-subtle px-4'>
@@ -126,7 +126,7 @@ const ChatWithHistory: FC<ChatWithHistoryProps> = ({
               </div>
             </div>
             {/* Content */}
-            <div className='flex-1 overflow-auto p-4'>
+            <div className='flex-1 overflow-hidden p-4'>
               {/* File info */}
               {previewData.filename && (
                 <div className='mb-2 text-xs font-medium text-text-secondary'>
@@ -158,15 +158,12 @@ const ChatWithHistory: FC<ChatWithHistoryProps> = ({
                 />
               )}
               {/* PDF preview with highlighting */}
-              {/\.pdf$/i.test(previewData.url) && (
+              {/\.pdf(#|$)/i.test(previewData.url) && (
                 <div className='relative h-full min-h-[600px] w-full overflow-hidden rounded-lg'>
                   <PdfViewerWithHighlight
                     url={previewData.url}
                     searchText={previewData.sourceText}
                     pageNumber={previewData.pageNumber}
-                    onFullTextExtracted={(fullText) => {
-                      setPreviewData(prev => prev ? { ...prev, fullText } : null)
-                    }}
                   />
                 </div>
               )}
