@@ -24,7 +24,9 @@ const CHUNK_API_URL = 'https://n8n.toho.vn/webhook/dbf0d2ae-ec68-4827-bdb7-f5dec
 // ============ Token-based matching types and functions ============
 interface PDFToken {
   text: string
-  normalized: string
+  raw: string  // original text, no changes
+  lowercase: string  // lowercase with punctuation
+  normalized: string  // lowercase without punctuation
   x: number
   y: number
   width: number
@@ -36,10 +38,21 @@ function normalizeToken(text: string): string {
   return text.toLowerCase().replace(/[^\w]/g, '').trim()
 }
 
-function tokenizeChunk(text: string): string[] {
+interface ChunkToken {
+  raw: string  // original text, no changes
+  lowercase: string  // lowercase with punctuation
+  normalized: string  // lowercase without punctuation
+}
+
+function tokenizeChunk(text: string): ChunkToken[] {
   return text.split(/\s+/)
-    .map(w => normalizeToken(w))
     .filter(w => w.length > 0)
+    .map(w => ({
+      raw: w.trim(),
+      lowercase: w.toLowerCase().trim(),
+      normalized: normalizeToken(w),
+    }))
+    .filter(t => t.raw.length > 0)  // Keep all tokens that have raw content
 }
 
 function tokenizePDF(items: any[]): PDFToken[] {
@@ -55,6 +68,8 @@ function tokenizePDF(items: any[]): PDFToken[] {
       if (normalized.length === 0) return
       tokens.push({
         text: word,
+        raw: word.trim(),
+        lowercase: word.toLowerCase().trim(),
         normalized,
         x: currentX,
         y: item.transform[5],
@@ -179,29 +194,22 @@ function calculateMatchScore(matchedIndices: number[], totalTokens: number): num
   return baseScore - gapPenalty + continuousBonus
 }
 
-function findSequentialMatches(
-  chunkTokens: string[],
+// Core matching logic - tries to match tokens from a given field
+type TokenField = 'raw' | 'lowercase' | 'normalized'
+
+function doSequentialMatch(
+  chunkTokenValues: string[],
   pdfTokens: PDFToken[],
+  pdfField: TokenField,
   similarityFn: (s1: string, s2: string) => number,
-): number[] {
-  if (chunkTokens.length === 0 || pdfTokens.length === 0) return []
-
-  // For short blocks (titles), use proximity matching instead of sequential
-  if (chunkTokens.length <= 15) {
-    const proximityResult = findProximityMatches(chunkTokens, pdfTokens, similarityFn)
-    if (proximityResult.length >= chunkTokens.length * 0.6) {
-      console.log(`[PDF]       Using proximity matching (short block): ${proximityResult.length}/${chunkTokens.length} tokens`)
-      return proximityResult
-    }
-  }
-
+): { indices: number[]; score: number } {
   const startCandidates: number[] = []
   for (let i = 0; i < pdfTokens.length; i++) {
-    if (tokensMatch(chunkTokens[0], pdfTokens[i].normalized, similarityFn))
+    if (tokensMatch(chunkTokenValues[0], pdfTokens[i][pdfField], similarityFn))
       startCandidates.push(i)
   }
 
-  if (startCandidates.length === 0) return []
+  if (startCandidates.length === 0) return { indices: [], score: 0 }
 
   let bestMatch = { indices: [] as number[], score: 0 }
 
@@ -214,8 +222,8 @@ function findSequentialMatches(
     const maxPdfGap = 20
     const maxChunkSkip = 20
 
-    while (chunkIdx < chunkTokens.length && pdfIdx < pdfTokens.length) {
-      if (tokensMatch(chunkTokens[chunkIdx], pdfTokens[pdfIdx].normalized, similarityFn)) {
+    while (chunkIdx < chunkTokenValues.length && pdfIdx < pdfTokens.length) {
+      if (tokensMatch(chunkTokenValues[chunkIdx], pdfTokens[pdfIdx][pdfField], similarityFn)) {
         matched.push(pdfIdx)
         pdfIdx++
         chunkIdx++
@@ -236,20 +244,83 @@ function findSequentialMatches(
       }
     }
 
-    // Calculate score for this match position
-    const score = calculateMatchScore(matched, chunkTokens.length)
-    const gaps = countGaps(matched)
-    const spans = findContinuousSpans(matched)
-    const longestSpan = spans.length > 0 ? Math.max(...spans.map(s => s.length)) : 0
-
-    console.log(`[PDF]       Pos ${startIdx}: ${matched.length}/${chunkTokens.length} tokens, ${gaps} gaps, longest span ${longestSpan} → score ${score.toFixed(1)}`)
-
+    const score = calculateMatchScore(matched, chunkTokenValues.length)
     if (score > bestMatch.score) {
       bestMatch = { indices: matched, score }
     }
   }
 
-  return bestMatch.indices
+  return bestMatch
+}
+
+function findSequentialMatches(
+  chunkTokens: ChunkToken[],
+  pdfTokens: PDFToken[],
+  similarityFn: (s1: string, s2: string) => number,
+): number[] {
+  if (chunkTokens.length === 0 || pdfTokens.length === 0) return []
+
+  // For short blocks (titles), use proximity matching instead of sequential
+  if (chunkTokens.length <= 15) {
+    const proximityResult = findProximityMatches(chunkTokens.map(t => t.normalized), pdfTokens, similarityFn)
+    if (proximityResult.length >= chunkTokens.length * 0.6) {
+      console.log(`[PDF]       Using proximity matching (short block): ${proximityResult.length}/${chunkTokens.length} tokens`)
+      return proximityResult
+    }
+  }
+
+  const threshold = 0.4  // 40% match rate to accept
+
+  // PASS 1: Try matching with RAW tokens (original case, with punctuation)
+  const rawValues = chunkTokens.map(t => t.raw)
+  const rawResult = doSequentialMatch(rawValues, pdfTokens, 'raw', similarityFn)
+  const rawRate = rawResult.indices.length / chunkTokens.length
+  console.log(`[PDF]       Pass 1 (raw): ${rawResult.indices.length}/${chunkTokens.length} tokens (${(rawRate * 100).toFixed(0)}%), score ${rawResult.score.toFixed(1)}`)
+
+  if (rawRate >= threshold) {
+    const gaps = countGaps(rawResult.indices)
+    const spans = findContinuousSpans(rawResult.indices)
+    const longestSpan = spans.length > 0 ? Math.max(...spans.map(s => s.length)) : 0
+    console.log(`[PDF]       ✓ Using raw: ${gaps} gaps, longest span ${longestSpan}`)
+    return rawResult.indices
+  }
+
+  // PASS 2: Try matching with LOWERCASE tokens (lowercase, with punctuation)
+  const lowercaseValues = chunkTokens.map(t => t.lowercase)
+  const lowercaseResult = doSequentialMatch(lowercaseValues, pdfTokens, 'lowercase', similarityFn)
+  const lowercaseRate = lowercaseResult.indices.length / chunkTokens.length
+  console.log(`[PDF]       Pass 2 (lowercase): ${lowercaseResult.indices.length}/${chunkTokens.length} tokens (${(lowercaseRate * 100).toFixed(0)}%), score ${lowercaseResult.score.toFixed(1)}`)
+
+  if (lowercaseRate >= threshold) {
+    const gaps = countGaps(lowercaseResult.indices)
+    const spans = findContinuousSpans(lowercaseResult.indices)
+    const longestSpan = spans.length > 0 ? Math.max(...spans.map(s => s.length)) : 0
+    console.log(`[PDF]       ✓ Using lowercase: ${gaps} gaps, longest span ${longestSpan}`)
+    return lowercaseResult.indices
+  }
+
+  // PASS 3: Try matching with NORMALIZED tokens (lowercase, no punctuation)
+  const normalizedValues = chunkTokens.map(t => t.normalized)
+  const normalizedResult = doSequentialMatch(normalizedValues, pdfTokens, 'normalized', similarityFn)
+  const normalizedRate = normalizedResult.indices.length / chunkTokens.length
+  console.log(`[PDF]       Pass 3 (normalized): ${normalizedResult.indices.length}/${chunkTokens.length} tokens (${(normalizedRate * 100).toFixed(0)}%), score ${normalizedResult.score.toFixed(1)}`)
+
+  // Pick the best result from all 3 passes
+  const results = [
+    { name: 'raw', result: rawResult },
+    { name: 'lowercase', result: lowercaseResult },
+    { name: 'normalized', result: normalizedResult },
+  ]
+  const best = results.reduce((a, b) => a.result.score > b.result.score ? a : b)
+
+  if (best.result.indices.length > 0) {
+    const gaps = countGaps(best.result.indices)
+    const spans = findContinuousSpans(best.result.indices)
+    const longestSpan = spans.length > 0 ? Math.max(...spans.map(s => s.length)) : 0
+    console.log(`[PDF]       ✓ Best: ${best.name} with ${gaps} gaps, longest span ${longestSpan}`)
+  }
+
+  return best.result.indices
 }
 
 function generateMatchedRects(
@@ -559,8 +630,11 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
           // Debug: Show what we're searching for
           if (i === 0) {
-            console.log(`[PDF]   Block 1 tokens:`, blockTokens.slice(0, 10))
-            console.log(`[PDF]   First 20 PDF tokens:`, pdfTokens.slice(0, 20).map(t => t.normalized))
+            console.log(`[PDF]   Block 1 has ${blockTokens.length} tokens:`)
+            console.log(`[PDF]     raw:`, blockTokens.map(t => t.raw))
+            console.log(`[PDF]     lowercase:`, blockTokens.map(t => t.lowercase))
+            console.log(`[PDF]     normalized:`, blockTokens.map(t => t.normalized))
+            console.log(`[PDF]   PDF has ${pdfTokens.length} tokens, first 50 (raw):`, pdfTokens.slice(0, 50).map(t => t.raw))
           }
 
           // Find matches for this block using token-based sequential matching
