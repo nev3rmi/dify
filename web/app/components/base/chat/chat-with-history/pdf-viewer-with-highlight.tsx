@@ -79,6 +79,49 @@ function tokensMatch(a: string, b: string, similarityFn: (s1: string, s2: string
   return false
 }
 
+// Proximity matching for short blocks (titles/headings) - finds tokens on same line regardless of order
+function findProximityMatches(
+  chunkTokens: string[],
+  pdfTokens: PDFToken[],
+  similarityFn: (s1: string, s2: string) => number,
+): number[] {
+  if (chunkTokens.length === 0 || pdfTokens.length === 0) return []
+
+  // Find first token to get anchor Y position
+  let anchorY = -1
+  let anchorIdx = -1
+  for (let i = 0; i < pdfTokens.length; i++) {
+    if (tokensMatch(chunkTokens[0], pdfTokens[i].normalized, similarityFn)) {
+      anchorY = pdfTokens[i].y
+      anchorIdx = i
+      break
+    }
+  }
+
+  if (anchorIdx === -1) return []
+
+  // Find all matching tokens within Y-range of anchor (same line ± tolerance)
+  const yTolerance = 20
+  const matched: number[] = []
+  const usedChunkTokens = new Set<number>()
+
+  for (let i = 0; i < pdfTokens.length; i++) {
+    if (Math.abs(pdfTokens[i].y - anchorY) > yTolerance) continue
+
+    // Find best matching chunk token
+    for (let j = 0; j < chunkTokens.length; j++) {
+      if (usedChunkTokens.has(j)) continue
+      if (tokensMatch(chunkTokens[j], pdfTokens[i].normalized, similarityFn)) {
+        matched.push(i)
+        usedChunkTokens.add(j)
+        break
+      }
+    }
+  }
+
+  return matched
+}
+
 // Helper: Count gaps in matched token indices
 function countGaps(indices: number[]): number {
   if (indices.length <= 1) return 0
@@ -142,6 +185,15 @@ function findSequentialMatches(
   similarityFn: (s1: string, s2: string) => number,
 ): number[] {
   if (chunkTokens.length === 0 || pdfTokens.length === 0) return []
+
+  // For short blocks (titles), use proximity matching instead of sequential
+  if (chunkTokens.length <= 15) {
+    const proximityResult = findProximityMatches(chunkTokens, pdfTokens, similarityFn)
+    if (proximityResult.length >= chunkTokens.length * 0.6) {
+      console.log(`[PDF]       Using proximity matching (short block): ${proximityResult.length}/${chunkTokens.length} tokens`)
+      return proximityResult
+    }
+  }
 
   const startCandidates: number[] = []
   for (let i = 0; i < pdfTokens.length; i++) {
@@ -504,6 +556,12 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
           totalTokens += blockTokens.length
 
           if (blockTokens.length < 1) continue
+
+          // Debug: Show what we're searching for
+          if (i === 0) {
+            console.log(`[PDF]   Block 1 tokens:`, blockTokens.slice(0, 10))
+            console.log(`[PDF]   First 20 PDF tokens:`, pdfTokens.slice(0, 20).map(t => t.normalized))
+          }
 
           // Find matches for this block using token-based sequential matching
           const matchedIndices = findSequentialMatches(blockTokens, pdfTokens, calculateSimilarity)
