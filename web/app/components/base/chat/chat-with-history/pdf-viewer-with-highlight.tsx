@@ -79,6 +79,63 @@ function tokensMatch(a: string, b: string, similarityFn: (s1: string, s2: string
   return false
 }
 
+// Helper: Count gaps in matched token indices
+function countGaps(indices: number[]): number {
+  if (indices.length <= 1) return 0
+  let gaps = 0
+  for (let i = 1; i < indices.length; i++) {
+    if (indices[i] !== indices[i - 1] + 1)
+      gaps++
+  }
+  return gaps
+}
+
+// Helper: Find continuous spans in matched indices
+function findContinuousSpans(indices: number[]): number[][] {
+  if (indices.length === 0) return []
+  const spans: number[][] = []
+  let currentSpan: number[] = [indices[0]]
+
+  for (let i = 1; i < indices.length; i++) {
+    if (indices[i] === indices[i - 1] + 1) {
+      currentSpan.push(indices[i])
+    }
+    else {
+      spans.push(currentSpan)
+      currentSpan = [indices[i]]
+    }
+  }
+  spans.push(currentSpan)
+  return spans
+}
+
+// Helper: Calculate match quality score
+function calculateMatchScore(matchedIndices: number[], totalTokens: number): number {
+  if (matchedIndices.length === 0) return 0
+
+  // Base score: match percentage
+  const baseScore = (matchedIndices.length / totalTokens) * 100
+
+  // Penalty for gaps (discontinuity)
+  const gaps = countGaps(matchedIndices)
+  const gapPenalty = gaps * 5
+
+  // Bonus for continuous spans
+  const spans = findContinuousSpans(matchedIndices)
+  let continuousBonus = 0
+  const longestSpan = Math.max(...spans.map(s => s.length))
+
+  for (const span of spans) {
+    if (span.length >= 10) continuousBonus += 10
+    if (span.length >= 20) continuousBonus += 10
+  }
+
+  // Extra bonus if longest span is >50% of total
+  if (longestSpan >= totalTokens * 0.5) continuousBonus += 20
+
+  return baseScore - gapPenalty + continuousBonus
+}
+
 function findSequentialMatches(
   chunkTokens: string[],
   pdfTokens: PDFToken[],
@@ -94,7 +151,7 @@ function findSequentialMatches(
 
   if (startCandidates.length === 0) return []
 
-  let bestMatch: number[] = []
+  let bestMatch = { indices: [] as number[], score: 0 }
 
   for (const startIdx of startCandidates) {
     const matched: number[] = []
@@ -127,11 +184,20 @@ function findSequentialMatches(
       }
     }
 
-    if (matched.length > bestMatch.length)
-      bestMatch = matched
+    // Calculate score for this match position
+    const score = calculateMatchScore(matched, chunkTokens.length)
+    const gaps = countGaps(matched)
+    const spans = findContinuousSpans(matched)
+    const longestSpan = spans.length > 0 ? Math.max(...spans.map(s => s.length)) : 0
+
+    console.log(`[PDF]       Pos ${startIdx}: ${matched.length}/${chunkTokens.length} tokens, ${gaps} gaps, longest span ${longestSpan} → score ${score.toFixed(1)}`)
+
+    if (score > bestMatch.score) {
+      bestMatch = { indices: matched, score }
+    }
   }
 
-  return bestMatch
+  return bestMatch.indices
 }
 
 function generateMatchedRects(
@@ -195,6 +261,7 @@ function generateMatchedRects(
       height: avgHeight,
       pageNumber,
     })
+    console.log(`[PDF]     Line: ${line.length} tokens merged → rect from x:${minX.toFixed(1)} to x:${maxX.toFixed(1)} (width: ${(maxX - minX).toFixed(1)})`)
   }
 
   return merged
@@ -437,8 +504,8 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
           if (matchedIndices.length > 0) {
             totalMatched += matchedIndices.length
             const blockRects = generateMatchedRects(matchedIndices, pdfTokens, pageNum)
+            console.log(`[PDF]   ✓ Block ${i + 1}: ${matchedIndices.length}/${blockTokens.length} tokens → ${blockRects.length} rects (${block.substring(0, 30)}...)`)
             allMatchedRects.push(...blockRects)
-            console.log(`[PDF]   ✓ Block ${i + 1}: ${matchedIndices.length}/${blockTokens.length} tokens (${block.substring(0, 30)}...)`)
           }
           else {
             console.log(`[PDF]   ✗ Block ${i + 1}: no matches (${block.substring(0, 30)}...)`)
