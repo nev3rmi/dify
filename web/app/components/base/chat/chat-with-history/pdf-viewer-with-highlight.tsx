@@ -79,6 +79,216 @@ function tokenizePDF(items: any[]): PDFToken[] {
   return tokens
 }
 
+// ============ Frequency-based common word detection (language-agnostic) ============
+const HIGH_FREQUENCY_THRESHOLD = 10 // Words appearing 10+ times are "common"
+
+interface WordFrequency {
+  word: string
+  count: number
+  isCommon: boolean
+}
+
+function analyzeWordFrequency(pdfTokens: PDFToken[]): Map<string, WordFrequency> {
+  const frequency = new Map<string, number>()
+
+  // Count occurrences of each word
+  for (const token of pdfTokens) {
+    const word = token.normalized
+    frequency.set(word, (frequency.get(word) || 0) + 1)
+  }
+
+  // Mark high-frequency words as "common"
+  const result = new Map<string, WordFrequency>()
+  for (const [word, count] of frequency) {
+    result.set(word, {
+      word,
+      count,
+      isCommon: count >= HIGH_FREQUENCY_THRESHOLD,
+    })
+  }
+
+  return result
+}
+
+function isCommonWord(word: string, wordFrequency: Map<string, WordFrequency>): boolean {
+  const freq = wordFrequency.get(word)
+  return freq ? freq.isCommon : false
+}
+
+// Phase 1: Match content words only (skip high-frequency words)
+function findContentWordMatches(
+  chunkTokens: string[],
+  pdfTokens: PDFToken[],
+  wordFrequency: Map<string, WordFrequency>,
+  similarityFn: (s1: string, s2: string) => number,
+): number[] {
+  // Filter to content words only (non-common words)
+  const contentTokens = chunkTokens.filter(t => !isCommonWord(t, wordFrequency))
+
+  if (contentTokens.length === 0) {
+    // All words are common - fall back to full matching
+    return findSequentialMatchesCore(chunkTokens, pdfTokens, similarityFn)
+  }
+
+  // Use sequential matching on content words only
+  return findSequentialMatchesCore(contentTokens, pdfTokens, similarityFn)
+}
+
+// Phase 2: Fill in common words within established cluster bounds
+function fillCommonWordsInCluster(
+  matchedIndices: number[],
+  chunkTokens: string[],
+  pdfTokens: PDFToken[],
+  wordFrequency: Map<string, WordFrequency>,
+): number[] {
+  if (matchedIndices.length === 0) return []
+
+  // Get Y-bounds of cluster (with generous tolerance for multi-line text)
+  const yValues = matchedIndices.map(i => pdfTokens[i].y)
+  const minY = Math.min(...yValues)
+  const maxY = Math.max(...yValues)
+  const yTolerance = 30 // Increased tolerance for wrapped lines
+
+  // For X-bounds, use full page width if text spans multiple lines
+  // This handles text that wraps from end of one line to start of next
+  const yRange = maxY - minY
+  const isMultiLine = yRange > 10 // If matches span multiple lines
+
+  let minX: number
+  let maxX: number
+  if (isMultiLine) {
+    // Multi-line text: use very wide X bounds (essentially full page)
+    minX = 0
+    maxX = 1000
+  }
+  else {
+    // Single line: use tighter X bounds
+    const xValues = matchedIndices.map(i => pdfTokens[i].x)
+    minX = Math.min(...xValues) - 100
+    maxX = Math.max(...xValues) + 100
+  }
+
+  // Find common words in PDF within cluster bounds
+  const filledIndices = [...matchedIndices]
+  const usedPositions = new Set(matchedIndices)
+  const chunkTokenSet = new Set(chunkTokens)
+
+  for (let i = 0; i < pdfTokens.length; i++) {
+    if (usedPositions.has(i)) continue
+
+    const token = pdfTokens[i]
+
+    // Check if within cluster bounds (both Y and X)
+    const inYRange = token.y >= minY - yTolerance && token.y <= maxY + yTolerance
+    const inXRange = token.x >= minX && token.x <= maxX
+
+    if (inYRange && inXRange) {
+      // Check if it's a common word that exists in chunk
+      if (isCommonWord(token.normalized, wordFrequency) && chunkTokenSet.has(token.normalized)) {
+        filledIndices.push(i)
+        usedPositions.add(i)
+      }
+    }
+  }
+
+  return filledIndices.sort((a, b) => a - b)
+}
+
+// ============ Spatial clustering and match scoring ============
+interface MatchCluster {
+  indices: number[]
+  minY: number
+  maxY: number
+  avgY: number
+}
+
+function clusterMatchesByProximity(
+  matchedIndices: number[],
+  pdfTokens: PDFToken[],
+  yTolerance: number = 50, // Max gap between lines in same cluster
+): MatchCluster[] {
+  if (matchedIndices.length === 0) return []
+
+  // Sort by Y position
+  const sorted = [...matchedIndices].sort((a, b) =>
+    pdfTokens[a].y - pdfTokens[b].y,
+  )
+
+  const clusters: MatchCluster[] = []
+  let currentCluster: number[] = [sorted[0]]
+
+  for (let i = 1; i < sorted.length; i++) {
+    const prevY = pdfTokens[sorted[i - 1]].y
+    const currY = pdfTokens[sorted[i]].y
+
+    if (Math.abs(currY - prevY) <= yTolerance) {
+      currentCluster.push(sorted[i])
+    }
+    else {
+      // Gap too large - start new cluster
+      if (currentCluster.length >= 2)
+        clusters.push(createCluster(currentCluster, pdfTokens))
+
+      currentCluster = [sorted[i]]
+    }
+  }
+
+  if (currentCluster.length >= 2)
+    clusters.push(createCluster(currentCluster, pdfTokens))
+
+  return clusters
+}
+
+function createCluster(indices: number[], pdfTokens: PDFToken[]): MatchCluster {
+  const yValues = indices.map(i => pdfTokens[i].y)
+  return {
+    indices,
+    minY: Math.min(...yValues),
+    maxY: Math.max(...yValues),
+    avgY: yValues.reduce((a, b) => a + b, 0) / yValues.length,
+  }
+}
+
+interface MatchScore {
+  matchRatio: number // % of chunk tokens matched
+  density: number // How tightly packed are matches
+  coherence: number // Are matches in expected Y-range
+  score: number // Combined score 0-1
+}
+
+function scoreBlockMatch(
+  matchedIndices: number[],
+  chunkTokens: string[],
+  pdfTokens: PDFToken[],
+): MatchScore {
+  if (matchedIndices.length === 0)
+    return { matchRatio: 0, density: 0, coherence: 0, score: 0 }
+
+  // 1. Match ratio (most important)
+  const matchRatio = matchedIndices.length / chunkTokens.length
+
+  // 2. Density - how many gaps between matched indices
+  let gaps = 0
+  for (let i = 1; i < matchedIndices.length; i++) {
+    const gap = matchedIndices[i] - matchedIndices[i - 1] - 1
+    if (gap > 3) gaps++
+  }
+  const density = 1 - (gaps / Math.max(1, matchedIndices.length - 1))
+
+  // 3. Coherence - Y-range should be reasonable for text length
+  const yValues = matchedIndices.map(i => pdfTokens[i].y)
+  const yRange = Math.max(...yValues) - Math.min(...yValues)
+  const expectedRange = chunkTokens.length * 3 // ~3px per token estimate
+  const coherence = yRange <= expectedRange * 2 ? 1 : Math.max(0, 1 - (yRange - expectedRange * 2) / 500)
+
+  // Combined score
+  const score = matchRatio * 0.5 + density * 0.3 + coherence * 0.2
+
+  return { matchRatio, density, coherence, score }
+}
+
+const MIN_MATCH_SCORE = 0.5 // Reject matches below this threshold (balanced)
+
 function tokensMatch(a: string, b: string, similarityFn: (s1: string, s2: string) => number): boolean {
   if (a === b) return true
   if (a.length >= 3 && b.length >= 3) {
@@ -133,7 +343,8 @@ function findProximityMatches(
   return matched
 }
 
-function findSequentialMatches(
+// Core sequential matching - used by two-phase matching
+function findSequentialMatchesCore(
   chunkTokens: string[],
   pdfTokens: PDFToken[],
   similarityFn: (s1: string, s2: string) => number,
@@ -143,9 +354,8 @@ function findSequentialMatches(
   // For short blocks (titles), use proximity matching instead of sequential
   if (chunkTokens.length <= 15) {
     const proximityResult = findProximityMatches(chunkTokens, pdfTokens, similarityFn)
-    if (proximityResult.length >= chunkTokens.length * 0.6) {
+    if (proximityResult.length >= chunkTokens.length * 0.6)
       return proximityResult
-    }
   }
 
   // Find all starting positions where first token matches
@@ -199,6 +409,135 @@ function findSequentialMatches(
   }
 
   return bestMatch
+}
+
+// Anchor-based matching: find start anchor, find end anchor, highlight everything between
+function findAnchorBasedMatches(
+  chunkTokens: string[],
+  pdfTokens: PDFToken[],
+  wordFrequency: Map<string, WordFrequency>,
+  similarityFn: (s1: string, s2: string) => number,
+): { indices: number[], startAnchorFound: boolean, endAnchorFound: boolean } {
+  if (chunkTokens.length === 0 || pdfTokens.length === 0)
+    return { indices: [], startAnchorFound: false, endAnchorFound: false }
+
+  // Get non-common tokens from the chunk for anchoring
+  const contentTokenIndices: number[] = []
+  for (let i = 0; i < chunkTokens.length; i++) {
+    if (!isCommonWord(chunkTokens[i], wordFrequency))
+      contentTokenIndices.push(i)
+  }
+
+  // If not enough content words, use all tokens
+  const anchorTokenIndices = contentTokenIndices.length >= 4
+    ? contentTokenIndices
+    : chunkTokens.map((_, i) => i)
+
+  // START ANCHOR: First 3-5 content words
+  const startAnchorSize = Math.min(5, Math.max(3, Math.floor(anchorTokenIndices.length / 3)))
+  const startAnchorIndices = anchorTokenIndices.slice(0, startAnchorSize)
+  const startAnchorTokens = startAnchorIndices.map(i => chunkTokens[i])
+
+  // END ANCHOR: Last 3-5 content words
+  const endAnchorSize = Math.min(5, Math.max(3, Math.floor(anchorTokenIndices.length / 3)))
+  const endAnchorIndices = anchorTokenIndices.slice(-endAnchorSize)
+  const endAnchorTokens = endAnchorIndices.map(i => chunkTokens[i])
+
+  // Find START anchor position in PDF
+  let startPdfIdx = -1
+  for (let i = 0; i < pdfTokens.length - startAnchorSize; i++) {
+    let matchCount = 0
+    let lastMatchIdx = i
+
+    for (const anchorToken of startAnchorTokens) {
+      // Search within a window after last match
+      for (let k = lastMatchIdx; k < Math.min(lastMatchIdx + 15, pdfTokens.length); k++) {
+        if (tokensMatch(anchorToken, pdfTokens[k].normalized, similarityFn)) {
+          matchCount++
+          lastMatchIdx = k + 1
+          break
+        }
+      }
+    }
+
+    // If we matched enough of the start anchor, we found the start
+    if (matchCount >= startAnchorSize * 0.6) {
+      startPdfIdx = i
+      break
+    }
+  }
+
+  if (startPdfIdx === -1)
+    return { indices: [], startAnchorFound: false, endAnchorFound: false }
+
+  // Find END anchor position in PDF (search after start position)
+  // Estimate where to start looking for end anchor
+  const estimatedSpan = chunkTokens.length * 1.5 // Allow for some extra tokens in PDF
+  const searchStartForEnd = startPdfIdx + Math.floor(chunkTokens.length * 0.5)
+
+  let endPdfIdx = -1
+  for (let i = searchStartForEnd; i < Math.min(startPdfIdx + estimatedSpan + 50, pdfTokens.length); i++) {
+    let matchCount = 0
+    let lastMatchIdx = i
+
+    for (const anchorToken of endAnchorTokens) {
+      for (let k = lastMatchIdx; k < Math.min(lastMatchIdx + 15, pdfTokens.length); k++) {
+        if (tokensMatch(anchorToken, pdfTokens[k].normalized, similarityFn)) {
+          matchCount++
+          lastMatchIdx = k + 1
+          break
+        }
+      }
+    }
+
+    // If we matched enough of the end anchor, we found the end
+    if (matchCount >= endAnchorSize * 0.6) {
+      endPdfIdx = lastMatchIdx // Use the last matched position
+      break
+    }
+  }
+
+  // If no end anchor found, estimate based on chunk length
+  const endAnchorFound = endPdfIdx !== -1
+  if (!endAnchorFound)
+    endPdfIdx = Math.min(startPdfIdx + chunkTokens.length + 10, pdfTokens.length - 1)
+
+  // Return ALL indices from start to end (highlight everything between anchors)
+  const result: number[] = []
+  for (let i = startPdfIdx; i <= endPdfIdx && i < pdfTokens.length; i++)
+    result.push(i)
+
+  return { indices: result, startAnchorFound: true, endAnchorFound }
+}
+
+// Main matching function: find scattered matches, then fill in everything between min and max
+function findSequentialMatches(
+  chunkTokens: string[],
+  pdfTokens: PDFToken[],
+  wordFrequency: Map<string, WordFrequency>,
+  similarityFn: (s1: string, s2: string) => number,
+): number[] {
+  // Step 1: Get content tokens only (skip high-frequency words for initial matching)
+  const contentTokens = chunkTokens.filter(t => !isCommonWord(t, wordFrequency))
+
+  // If all words are common, use full tokens
+  const tokensToMatch = contentTokens.length >= 3 ? contentTokens : chunkTokens
+
+  // Step 2: Find scattered matches using core sequential matching
+  const scatteredMatches = findSequentialMatchesCore(tokensToMatch, pdfTokens, similarityFn)
+
+  if (scatteredMatches.length < 2) return scatteredMatches
+
+  // Step 3: Fill in EVERYTHING between first and last match (complete the span)
+  const minIdx = Math.min(...scatteredMatches)
+  const maxIdx = Math.max(...scatteredMatches)
+
+  // Return all indices from min to max (fills gaps, highlights complete sentence)
+  const filledIndices: number[] = []
+  for (let i = minIdx; i <= maxIdx; i++)
+    filledIndices.push(i)
+
+  return filledIndices
 }
 
 function generateMatchedRects(
@@ -454,6 +793,11 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
         const pdfTokens = tokenizePDF(items)
         addLog(`📄 PDF has ${pdfTokens.length} tokens`)
 
+        // Analyze word frequency for common word detection (language-agnostic)
+        const wordFrequency = analyzeWordFrequency(pdfTokens)
+        const commonWords = [...wordFrequency.values()].filter(w => w.isCommon).map(w => w.word)
+        addLog(`📊 Detected ${commonWords.length} high-frequency words: ${commonWords.slice(0, 5).join(', ')}${commonWords.length > 5 ? '...' : ''}`)
+
         // Split by newlines to get individual blocks/areas
         const allBlocks = textToSearch
           .split('\n')
@@ -464,7 +808,7 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
         const uniqueBlocks = [...new Set(allBlocks)]
         addLog(`📝 ${allBlocks.length} blocks → ${uniqueBlocks.length} unique blocks`)
 
-        // Match each block independently
+        // Match each block using anchor-based matching (find start → find end → highlight all between)
         const allMatchedRects: Array<{ x1: number, y1: number, x2: number, y2: number, width: number, height: number, pageNumber: number }> = []
         let totalMatched = 0
         let totalTokens = 0
@@ -476,14 +820,14 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
 
           if (blockTokens.length < 1) continue // Only skip empty blocks
 
-          // Find matches for this block
-          const matchedIndices = findSequentialMatches(blockTokens, pdfTokens, calculateSimilarity)
+          // Find matches and fill in everything between first and last match
+          const matchedIndices = findSequentialMatches(blockTokens, pdfTokens, wordFrequency, calculateSimilarity)
 
           if (matchedIndices.length > 0) {
             totalMatched += matchedIndices.length
             const blockRects = generateMatchedRects(matchedIndices, pdfTokens, pageNum)
             allMatchedRects.push(...blockRects)
-            addLog(`  ✓ Block ${i + 1}: ${matchedIndices.length}/${blockTokens.length} tokens (${block.substring(0, 30)}...)`)
+            addLog(`  ✓ Block ${i + 1}: ${matchedIndices.length} tokens highlighted (${block.substring(0, 30)}...)`)
           }
           else {
             addLog(`  ✗ Block ${i + 1}: no matches (${block.substring(0, 30)}...)`)
