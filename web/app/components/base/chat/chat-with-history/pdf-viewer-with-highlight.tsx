@@ -90,12 +90,63 @@ function tokensMatch(a: string, b: string, similarityFn: (s1: string, s2: string
   return false
 }
 
+// For short blocks (titles), find all matching tokens by proximity (non-sequential)
+function findProximityMatches(
+  chunkTokens: string[],
+  pdfTokens: PDFToken[],
+  similarityFn: (s1: string, s2: string) => number,
+): number[] {
+  if (chunkTokens.length === 0 || pdfTokens.length === 0) return []
+
+  // Find first token to get anchor Y position
+  let anchorY = -1
+  let anchorIdx = -1
+  for (let i = 0; i < pdfTokens.length; i++) {
+    if (tokensMatch(chunkTokens[0], pdfTokens[i].normalized, similarityFn)) {
+      anchorY = pdfTokens[i].y
+      anchorIdx = i
+      break
+    }
+  }
+
+  if (anchorIdx === -1) return []
+
+  // Find all matching tokens within Y-range of anchor (same line ± tolerance)
+  const yTolerance = 20 // pixels
+  const matched: number[] = []
+  const usedChunkTokens = new Set<number>()
+
+  for (let i = 0; i < pdfTokens.length; i++) {
+    if (Math.abs(pdfTokens[i].y - anchorY) > yTolerance) continue
+
+    // Find best matching chunk token
+    for (let j = 0; j < chunkTokens.length; j++) {
+      if (usedChunkTokens.has(j)) continue
+      if (tokensMatch(chunkTokens[j], pdfTokens[i].normalized, similarityFn)) {
+        matched.push(i)
+        usedChunkTokens.add(j)
+        break
+      }
+    }
+  }
+
+  return matched
+}
+
 function findSequentialMatches(
   chunkTokens: string[],
   pdfTokens: PDFToken[],
   similarityFn: (s1: string, s2: string) => number,
 ): number[] {
   if (chunkTokens.length === 0 || pdfTokens.length === 0) return []
+
+  // For short blocks (titles), use proximity matching instead of sequential
+  if (chunkTokens.length <= 15) {
+    const proximityResult = findProximityMatches(chunkTokens, pdfTokens, similarityFn)
+    if (proximityResult.length >= chunkTokens.length * 0.6) {
+      return proximityResult
+    }
+  }
 
   // Find all starting positions where first token matches
   const startCandidates: number[] = []
@@ -115,7 +166,7 @@ function findSequentialMatches(
     let chunkIdx = 0
     let pdfGaps = 0
     let chunkSkips = 0
-    const maxPdfGap = 5 // Allow skipping up to 5 PDF tokens
+    const maxPdfGap = 20 // Allow skipping up to 20 PDF tokens (handles styled/italic text)
     const maxChunkSkip = 20 // Allow skipping up to 20 chunk tokens (handles duplicated content)
 
     while (chunkIdx < chunkTokens.length && pdfIdx < pdfTokens.length) {
