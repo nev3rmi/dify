@@ -32,6 +32,193 @@ const CHUNK_API_URL = 'https://n8n.toho.vn/webhook/dbf0d2ae-ec68-4827-bdb7-f5dec
 // Pipeline steps - each step must complete before the next can start
 type PipelineStep = 'init' | 'container_ready' | 'api_complete' | 'scaling_done' | 'highlights_ready' | 'viewer_ready' | 'complete'
 
+// ============ Token-based matching types and functions ============
+interface PDFToken {
+  text: string
+  normalized: string
+  x: number
+  y: number
+  width: number
+  height: number
+  itemIndex: number
+}
+
+function normalizeToken(text: string): string {
+  return text.toLowerCase().replace(/[^\w]/g, '').trim()
+}
+
+function tokenizeChunk(text: string): string[] {
+  return text.split(/\s+/)
+    .map(w => normalizeToken(w))
+    .filter(w => w.length > 0)
+}
+
+function tokenizePDF(items: any[]): PDFToken[] {
+  const tokens: PDFToken[] = []
+  items.forEach((item, idx) => {
+    if (!item.str) return
+    const words = item.str.split(/\s+/).filter((w: string) => w.length > 0)
+    const charWidth = item.str.length > 0 ? item.width / item.str.length : 0
+    let currentX = item.transform[4]
+
+    words.forEach((word: string) => {
+      const normalized = normalizeToken(word)
+      if (normalized.length === 0) return
+      tokens.push({
+        text: word,
+        normalized,
+        x: currentX,
+        y: item.transform[5],
+        width: word.length * charWidth,
+        height: item.height || Math.abs(item.transform[3]),
+        itemIndex: idx,
+      })
+      currentX += (word.length + 1) * charWidth
+    })
+  })
+  return tokens
+}
+
+function tokensMatch(a: string, b: string, similarityFn: (s1: string, s2: string) => number): boolean {
+  if (a === b) return true
+  if (a.length >= 3 && b.length >= 3) {
+    if (a.includes(b) || b.includes(a)) return true
+    if (a.length >= 4 && b.length >= 4) {
+      return similarityFn(a, b) >= 0.8
+    }
+  }
+  return false
+}
+
+function findSequentialMatches(
+  chunkTokens: string[],
+  pdfTokens: PDFToken[],
+  similarityFn: (s1: string, s2: string) => number,
+): number[] {
+  if (chunkTokens.length === 0 || pdfTokens.length === 0) return []
+
+  // Find all starting positions where first token matches
+  const startCandidates: number[] = []
+  for (let i = 0; i < pdfTokens.length; i++) {
+    if (tokensMatch(chunkTokens[0], pdfTokens[i].normalized, similarityFn))
+      startCandidates.push(i)
+  }
+
+  if (startCandidates.length === 0) return []
+
+  // For each start, try sequential matching
+  let bestMatch: number[] = []
+
+  for (const startIdx of startCandidates) {
+    const matched: number[] = []
+    let pdfIdx = startIdx
+    let chunkIdx = 0
+    let pdfGaps = 0
+    let chunkSkips = 0
+    const maxPdfGap = 5 // Allow skipping up to 5 PDF tokens
+    const maxChunkSkip = 20 // Allow skipping up to 20 chunk tokens (handles duplicated content)
+
+    while (chunkIdx < chunkTokens.length && pdfIdx < pdfTokens.length) {
+      if (tokensMatch(chunkTokens[chunkIdx], pdfTokens[pdfIdx].normalized, similarityFn)) {
+        matched.push(pdfIdx)
+        pdfIdx++
+        chunkIdx++
+        pdfGaps = 0
+        chunkSkips = 0
+      }
+      else {
+        // Try skipping PDF token first
+        pdfGaps++
+        if (pdfGaps <= maxPdfGap) {
+          pdfIdx++
+        }
+        else {
+          // PDF gap exhausted, try skipping chunk token instead
+          // This handles duplicated/corrupted chunk text
+          pdfGaps = 0
+          chunkSkips++
+          if (chunkSkips > maxChunkSkip) break
+          chunkIdx++
+        }
+      }
+    }
+
+    if (matched.length > bestMatch.length)
+      bestMatch = matched
+  }
+
+  return bestMatch
+}
+
+function generateMatchedRects(
+  matchedIndices: number[],
+  pdfTokens: PDFToken[],
+  pageNumber: number,
+): Array<{ x1: number, y1: number, x2: number, y2: number, width: number, height: number, pageNumber: number }> {
+  const rects: Array<{ x1: number, y1: number, x2: number, y2: number, width: number, height: number, pageNumber: number }> = []
+
+  for (const idx of matchedIndices) {
+    const token = pdfTokens[idx]
+    const yOffset = token.height * 0.15
+    rects.push({
+      x1: token.x,
+      y1: token.y - yOffset,
+      x2: token.x + token.width,
+      y2: token.y + token.height - yOffset,
+      width: token.width,
+      height: token.height,
+      pageNumber,
+    })
+  }
+
+  // Merge rects on same line - fill gaps between matched tokens
+  if (rects.length === 0) return []
+
+  const sorted = [...rects].sort((a, b) => {
+    const yDiff = a.y1 - b.y1
+    if (Math.abs(yDiff) < 5) return a.x1 - b.x1
+    return yDiff
+  })
+
+  // Group rects by line (same Y coordinate within tolerance)
+  const lines: Array<typeof rects> = []
+  let currentLine: typeof rects = [sorted[0]]
+
+  for (let i = 1; i < sorted.length; i++) {
+    const sameLine = Math.abs(sorted[i].y1 - currentLine[0].y1) < 5
+    if (sameLine) {
+      currentLine.push(sorted[i])
+    }
+    else {
+      lines.push(currentLine)
+      currentLine = [sorted[i]]
+    }
+  }
+  lines.push(currentLine)
+
+  // For each line, create one rect from leftmost to rightmost token (fills gaps)
+  const merged: typeof rects = []
+  for (const line of lines) {
+    const minX = Math.min(...line.map(r => r.x1))
+    const maxX = Math.max(...line.map(r => r.x2))
+    const avgY1 = line.reduce((sum, r) => sum + r.y1, 0) / line.length
+    const avgY2 = line.reduce((sum, r) => sum + r.y2, 0) / line.length
+    const avgHeight = line.reduce((sum, r) => sum + r.height, 0) / line.length
+
+    merged.push({
+      x1: minX,
+      y1: avgY1,
+      x2: maxX,
+      y2: avgY2,
+      width: maxX - minX,
+      height: avgHeight,
+      pageNumber,
+    })
+  }
+
+  return merged
+}
+
 const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
   pdfDocument,
   searchText,
@@ -202,245 +389,94 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
 
     const findTextHighlight = async () => {
       try {
-        addLog('🚀 Computing highlights...')
+        addLog('🚀 Starting block-by-block matching...')
 
         const pageNum = apiPageNumber || (pageNumber ? Number.parseInt(pageNumber) : 1)
         const page = await pdfDocument.getPage(pageNum)
         const viewport = page.getViewport({ scale: 1.0 })
-
         const textContent = await page.getTextContent()
         const items = textContent.items as any[]
+
         addLog(`📄 Page ${pageNum}: ${items.length} text items`)
 
-        const normalizeText = (text: string) => text
-          .toLowerCase()
-          .replace(/\s+/g, ' ')
-          .trim()
+        // Tokenize PDF once (reused for all blocks)
+        const pdfTokens = tokenizePDF(items)
+        addLog(`📄 PDF has ${pdfTokens.length} tokens`)
 
-        let fullText = ''
-        let normalizedText = ''
-        const textPositions: Array<{
-          text: string
-          transform: number[]
-          width: number
-          height: number
-          index: number
-          normalizedIndex: number
-        }> = []
+        // Split by newlines to get individual blocks/areas
+        const allBlocks = textToSearch
+          .split('\n')
+          .map(s => s.trim())
+          .filter(s => s.length > 10) // Skip very short fragments
 
-        items.forEach((item: any) => {
-          if (item.str) {
-            const normalizedItem = normalizeText(item.str)
-            textPositions.push({
-              text: item.str,
-              transform: item.transform,
-              width: item.width,
-              height: item.height,
-              index: fullText.length,
-              normalizedIndex: normalizedText.length,
-            })
-            fullText += `${item.str} `
-            normalizedText += `${normalizedItem} `
+        // Remove duplicate blocks
+        const uniqueBlocks = [...new Set(allBlocks)]
+        addLog(`📝 ${allBlocks.length} blocks → ${uniqueBlocks.length} unique blocks`)
+
+        // Match each block independently
+        const allMatchedRects: Array<{ x1: number, y1: number, x2: number, y2: number, width: number, height: number, pageNumber: number }> = []
+        let totalMatched = 0
+        let totalTokens = 0
+
+        for (let i = 0; i < uniqueBlocks.length; i++) {
+          const block = uniqueBlocks[i]
+          const blockTokens = tokenizeChunk(block)
+          totalTokens += blockTokens.length
+
+          if (blockTokens.length < 1) continue // Only skip empty blocks
+
+          // Find matches for this block
+          const matchedIndices = findSequentialMatches(blockTokens, pdfTokens, calculateSimilarity)
+
+          if (matchedIndices.length > 0) {
+            totalMatched += matchedIndices.length
+            const blockRects = generateMatchedRects(matchedIndices, pdfTokens, pageNum)
+            allMatchedRects.push(...blockRects)
+            addLog(`  ✓ Block ${i + 1}: ${matchedIndices.length}/${blockTokens.length} tokens (${block.substring(0, 30)}...)`)
           }
-        })
-
-        const normalizedFullText = normalizeText(fullText)
-
-        const lines = textToSearch.split('\n').filter(l => l.trim().length > 10)
-        if (lines.length === 0)
-          lines.push(textToSearch)
-
-        const anchorLine = lines.reduce((a, b) => a.length > b.length ? a : b)
-        const anchorNormalized = normalizeText(anchorLine)
-
-        const anchorIndex = normalizedFullText.indexOf(anchorNormalized)
-        let anchorY = 0
-        let anchorFound = false
-
-        if (anchorIndex !== -1) {
-          for (const pos of textPositions) {
-            const posNormalized = normalizeText(pos.text)
-            if (anchorNormalized.includes(posNormalized) && posNormalized.length > 3) {
-              anchorY = pos.transform[5]
-              anchorFound = true
-              break
-            }
+          else {
+            addLog(`  ✗ Block ${i + 1}: no matches (${block.substring(0, 30)}...)`)
           }
         }
 
-        if (!anchorFound) {
-          const anchorFirstWord = anchorNormalized.split(' ')[0]
-          for (const pos of textPositions) {
-            const posNormalized = normalizeText(pos.text)
-            if (posNormalized.includes(anchorFirstWord) || calculateSimilarity(posNormalized, anchorNormalized) > 0.6) {
-              anchorY = pos.transform[5]
-              anchorFound = true
-              break
-            }
-          }
+        if (allMatchedRects.length === 0) {
+          addLog('⚠️ No matches found in any block')
+          setPipelineStep('viewer_ready')
+          return
         }
 
-        const PROXIMITY_THRESHOLD = 300
-        const matchedRects: Array<{
-          x1: number
-          y1: number
-          x2: number
-          y2: number
-          width: number
-          height: number
-          pageNumber: number
-        }> = []
+        addLog(`✅ Total: ${totalMatched}/${totalTokens} tokens (${(totalMatched / totalTokens * 100).toFixed(0)}%)`)
 
-        const addRect = (pos: typeof textPositions[0], pNum: number) => {
-          const [, , , scaleY, x, y] = pos.transform
-          const height = pos.height || Math.abs(scaleY)
-          const width = pos.width
-
-          const isDuplicate = matchedRects.some(r =>
-            Math.abs(r.x1 - x) < 1 && Math.abs(r.y1 - y) < 1,
-          )
-
-          if (!isDuplicate && width > 0) {
-            const yOffset = height * 0.15
-            matchedRects.push({
-              x1: x,
-              y1: y - yOffset,
-              x2: x + width,
-              y2: y + height - yOffset,
-              width,
-              height,
-              pageNumber: pNum,
-            })
-          }
+        // Create highlight from all matched rects
+        const boundingRect = {
+          x1: Math.min(...allMatchedRects.map(r => r.x1)),
+          y1: Math.min(...allMatchedRects.map(r => r.y1)),
+          x2: Math.max(...allMatchedRects.map(r => r.x2)),
+          y2: Math.max(...allMatchedRects.map(r => r.y2)),
+          width: viewport.width,
+          height: viewport.height,
+          pageNumber: pageNum,
         }
 
-        const matchedLines = new Set<number>()
-
-        // First pass: Full sentence matching
-        for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-          const line = lines[lineIdx]
-          const lineNormalized = normalizeText(line)
-
-          if (lineNormalized.length < 20)
-            continue
-
-          const sentenceIndex = normalizedFullText.indexOf(lineNormalized)
-
-          if (sentenceIndex !== -1) {
-            matchedLines.add(lineIdx)
-            const sentenceEnd = sentenceIndex + lineNormalized.length
-
-            for (const pos of textPositions) {
-              const posY = pos.transform[5]
-              if (anchorFound && Math.abs(posY - anchorY) > PROXIMITY_THRESHOLD)
-                continue
-
-              const posStart = pos.normalizedIndex
-              const posEnd = pos.normalizedIndex + normalizeText(pos.text).length + 1
-              const hasOverlap = posStart < sentenceEnd + 5 && posEnd > sentenceIndex - 2
-
-              if (hasOverlap)
-                addRect(pos, pageNum)
-            }
-          }
-        }
-
-        // Second pass: Fragment matching
-        const SIMILARITY_THRESHOLD = 0.80
-
-        for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-          if (matchedLines.has(lineIdx))
-            continue
-
-          const line = lines[lineIdx]
-          const lineNormalized = normalizeText(line)
-          const lineWords = lineNormalized.split(' ').filter(w => w.length >= 6)
-
-          for (const pos of textPositions) {
-            const posNormalized = normalizeText(pos.text)
-            const posY = pos.transform[5]
-
-            if (anchorFound && Math.abs(posY - anchorY) > PROXIMITY_THRESHOLD)
-              continue
-
-            if (posNormalized.length < 3)
-              continue
-
-            let isMatch = false
-
-            if (posNormalized.length >= 5 && lineNormalized.includes(posNormalized))
-              isMatch = true
-
-            if (!isMatch && posNormalized.length >= 15) {
-              const similarity = calculateSimilarity(posNormalized, lineNormalized)
-              if (similarity >= SIMILARITY_THRESHOLD)
-                isMatch = true
-            }
-
-            if (!isMatch && lineWords.length >= 2) {
-              const matchingWords = lineWords.filter(word => posNormalized.includes(word))
-              if (matchingWords.length >= 2)
-                isMatch = true
-            }
-
-            if (isMatch)
-              addRect(pos, pageNum)
-          }
-        }
-
-        // Third pass: Fill gaps
-        if (matchedRects.length > 0) {
-          const minY = Math.min(...matchedRects.map(r => r.y1))
-          const maxY = Math.max(...matchedRects.map(r => r.y2))
-
-          for (const pos of textPositions) {
-            const posText = normalizeText(pos.text)
-            const [, , , scaleY, , y] = pos.transform
-            const height = pos.height || Math.abs(scaleY)
-
-            if (posText.length < 2)
-              continue
-
-            const posTop = y - height * 0.15
-            const posBottom = y + height - height * 0.15
-
-            if (posTop >= minY - 5 && posBottom <= maxY + 5)
-              addRect(pos, pageNum)
-          }
-        }
-
-        if (matchedRects.length > 0) {
-          const boundingRect = {
-            x1: Math.min(...matchedRects.map(r => r.x1)),
-            y1: Math.min(...matchedRects.map(r => r.y1)),
-            x2: Math.max(...matchedRects.map(r => r.x2)),
-            y2: Math.max(...matchedRects.map(r => r.y2)),
-            width: viewport.width,
-            height: viewport.height,
+        const newHighlight: IHighlight = {
+          id: `highlight-${Date.now()}`,
+          position: {
+            boundingRect,
+            rects: allMatchedRects,
             pageNumber: pageNum,
-          }
-
-          const newHighlight: IHighlight = {
-            id: `highlight-${Date.now()}`,
-            position: {
-              boundingRect,
-              rects: matchedRects,
-              pageNumber: pageNum,
-              usePdfCoordinates: true,
-            } as ScaledPosition,
-            content: { text: textToSearch },
-            comment: { text: '', emoji: '' },
-          }
-
-          setHighlights([newHighlight])
-          addLog('🎉 Highlights computed!')
+            usePdfCoordinates: true,
+          } as ScaledPosition,
+          content: { text: textToSearch },
+          comment: { text: '', emoji: '' },
         }
 
-        // Next step: viewer ready
+        setHighlights([newHighlight])
+        addLog(`🎉 Created highlight with ${allMatchedRects.length} rects from ${uniqueBlocks.length} blocks`)
+
         setPipelineStep('viewer_ready')
       }
       catch (error: any) {
-        console.error('Error finding highlights:', error)
+        console.error('Highlight error:', error)
         addLog(`❌ Error: ${error.message}`)
         setPipelineStep('viewer_ready')
       }
