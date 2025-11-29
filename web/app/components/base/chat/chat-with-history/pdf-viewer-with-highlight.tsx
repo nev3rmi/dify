@@ -593,13 +593,72 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     }
   }, [onReady, scale])
 
+  // Normalization helpers for sentence matching
+  const normalizeWithSpaces = useCallback((text: string) => text.toLowerCase().replace(/\s+/g, ' ').trim(), [])
+  const normalizeNoSpaces = useCallback((text: string) => text.toLowerCase().replace(/\s+/g, '').trim(), [])
+
+  // Build full text map with position tracking
+  interface TextPosition {
+    text: string
+    transform: number[]
+    width: number
+    height: number
+    startIndexWithSpaces: number
+    startIndexNoSpaces: number
+  }
+
+  const buildFullTextMap = useCallback((items: any[]) => {
+    let fullTextWithSpaces = ''
+    let fullTextNoSpaces = ''
+    const textPositions: TextPosition[] = []
+
+    items.forEach((item: any) => {
+      if (!item.str) return
+
+      textPositions.push({
+        text: item.str,
+        transform: item.transform,
+        width: item.width,
+        height: item.height || Math.abs(item.transform[3]),
+        startIndexWithSpaces: fullTextWithSpaces.length,
+        startIndexNoSpaces: fullTextNoSpaces.length,
+      })
+
+      fullTextWithSpaces += item.str + ' '
+      fullTextNoSpaces += item.str.toLowerCase().replace(/\s+/g, '')
+    })
+
+    return {
+      fullTextWithSpaces: normalizeWithSpaces(fullTextWithSpaces),
+      fullTextNoSpaces,
+      textPositions,
+    }
+  }, [normalizeWithSpaces])
+
+  // Create rect from text position
+  const createRectFromPosition = useCallback((pos: TextPosition, pageNumber: number) => {
+    const [, , , scaleY, x, y] = pos.transform
+    const height = pos.height
+    const yOffset = height * 0.15
+
+    return {
+      x1: x,
+      y1: y - yOffset,
+      x2: x + pos.width,
+      y2: y + height - yOffset,
+      width: pos.width,
+      height,
+      pageNumber,
+    }
+  }, [])
+
   // Find and create highlights when everything is ready
   useEffect(() => {
     if (!isFullyReady || !chunkContext || !pdfDocument || hasHighlightedRef.current) return
     hasHighlightedRef.current = true
 
     const findHighlights = async () => {
-      console.log('[PDF] 🚀 Starting token-based block matching...')
+      console.log('[PDF] 🚀 Starting hybrid sentence + token matching...')
       console.log('[PDF] Source text from n8n API:', chunkContext.substring(0, 200))
 
       try {
@@ -611,7 +670,11 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
         console.log(`[PDF] 📄 Page ${pageNum}: ${items.length} text items`)
 
-        // Tokenize PDF once (reused for all blocks)
+        // Build full text map for sentence matching
+        const { fullTextWithSpaces, fullTextNoSpaces, textPositions } = buildFullTextMap(items)
+        console.log(`[PDF] 📝 Full text length: ${fullTextWithSpaces.length} chars`)
+
+        // Also build token array for fallback
         const pdfTokens = tokenizePDF(items)
         console.log(`[PDF] 📄 PDF has ${pdfTokens.length} tokens`)
 
@@ -681,13 +744,70 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
             }
           }
 
-          // Find matches for this block using token-based sequential matching
-          const matchedIndices = findSequentialMatches(blockTokens, pdfTokens, calculateSimilarity)
+          // PASS 1: Try sentence matching (dual normalization)
+          let blockRects: Array<{ x1: number; y1: number; x2: number; y2: number; width: number; height: number; pageNumber: number }> = []
+          let matchMethod = ''
 
-          if (matchedIndices.length > 0) {
-            totalMatched += matchedIndices.length
-            const blockRects = generateMatchedRects(matchedIndices, pdfTokens, pageNum)
-            console.log(`[PDF]   ✓ Block ${i + 1}: ${matchedIndices.length}/${blockTokens.length} tokens → ${blockRects.length} rects (${block.substring(0, 30)}...)`)
+          // Try with spaces first
+          const normalizedBlock = normalizeWithSpaces(block)
+          let sentenceIndex = fullTextWithSpaces.indexOf(normalizedBlock)
+
+          if (sentenceIndex !== -1) {
+            matchMethod = 'sentence (with spaces)'
+            // Find all text positions that overlap with this sentence
+            const sentenceEnd = sentenceIndex + normalizedBlock.length
+
+            for (const pos of textPositions) {
+              const posNormalized = normalizeWithSpaces(pos.text)
+              const posStart = pos.startIndexWithSpaces
+              const posEnd = posStart + posNormalized.length + 1 // +1 for space
+
+              // Check overlap
+              if (posStart < sentenceEnd + 5 && posEnd > sentenceIndex - 2) {
+                blockRects.push(createRectFromPosition(pos, pageNum))
+              }
+            }
+          }
+
+          // Try without spaces if first attempt failed
+          if (blockRects.length === 0) {
+            const normalizedBlockNoSpaces = normalizeNoSpaces(block)
+            sentenceIndex = fullTextNoSpaces.indexOf(normalizedBlockNoSpaces)
+
+            if (sentenceIndex !== -1) {
+              matchMethod = 'sentence (no spaces)'
+              const sentenceEnd = sentenceIndex + normalizedBlockNoSpaces.length
+
+              for (const pos of textPositions) {
+                const posNormalized = normalizeNoSpaces(pos.text)
+                const posStart = pos.startIndexNoSpaces
+                const posEnd = posStart + posNormalized.length
+
+                // Check overlap
+                if (posStart < sentenceEnd + 3 && posEnd > sentenceIndex - 1) {
+                  blockRects.push(createRectFromPosition(pos, pageNum))
+                }
+              }
+            }
+          }
+
+          // PASS 2: Fall back to token matching if sentence matching failed
+          if (blockRects.length === 0) {
+            matchMethod = 'token'
+            const matchedIndices = findSequentialMatches(blockTokens, pdfTokens, calculateSimilarity)
+
+            if (matchedIndices.length > 0) {
+              totalMatched += matchedIndices.length
+              blockRects = generateMatchedRects(matchedIndices, pdfTokens, pageNum)
+            }
+          }
+          else {
+            // Sentence matching succeeded, count as all tokens matched
+            totalMatched += blockTokens.length
+          }
+
+          if (blockRects.length > 0) {
+            console.log(`[PDF]   ✓ Block ${i + 1}: ${matchMethod} → ${blockRects.length} rects (${block.substring(0, 30)}...)`)
             allMatchedRects.push(...blockRects)
           }
           else {
@@ -734,7 +854,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     }
 
     findHighlights()
-  }, [isFullyReady, chunkContext, pdfDocument, calculateSimilarity])
+  }, [isFullyReady, chunkContext, pdfDocument, calculateSimilarity, normalizeWithSpaces, normalizeNoSpaces, buildFullTextMap, createRectFromPosition])
 
   // Memoize callbacks to prevent PdfHighlighter re-renders
   const enableAreaSelection = useCallback(() => false, [])
