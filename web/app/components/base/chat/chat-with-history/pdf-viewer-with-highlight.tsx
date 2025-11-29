@@ -1,7 +1,13 @@
 import type { FC } from 'react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import 'react-pdf-highlighter/dist/style.css'
 import { Highlight, PdfHighlighter, PdfLoader } from 'react-pdf-highlighter'
+
+// CSS override for highlight color (yellow instead of red)
+const highlightColorStyle = `
+  .Highlight__part { background-color: rgba(255, 226, 143, 0.6) !important; }
+  .Highlight--scrolledTo .Highlight__part { background-color: rgba(255, 200, 0, 0.7) !important; }
+`
 import type { IHighlight, ScaledPosition } from 'react-pdf-highlighter'
 import Loading from '@/app/components/base/loading'
 
@@ -23,6 +29,9 @@ type PdfHighlighterWrapperProps = {
 
 const CHUNK_API_URL = 'https://n8n.toho.vn/webhook/dbf0d2ae-ec68-4827-bdb7-f5dec29c2b1d'
 
+// Pipeline steps - each step must complete before the next can start
+type PipelineStep = 'init' | 'container_ready' | 'api_complete' | 'scaling_done' | 'highlights_ready' | 'viewer_ready' | 'complete'
+
 const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
   pdfDocument,
   searchText,
@@ -30,25 +39,29 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
   chunkId,
   onFullTextExtracted,
 }) => {
+  // Pipeline state - start with container_ready to begin immediately
+  const [pipelineStep, setPipelineStep] = useState<PipelineStep>('container_ready')
+
+  // Data states
   const [highlights, setHighlights] = useState<IHighlight[]>([])
-  const [isScalingDone, setIsScalingDone] = useState(false)
-  const [isViewerReady, setIsViewerReady] = useState(false)
   const [fullChunkContext, setFullChunkContext] = useState<string | null>(null)
   const [apiPageNumber, setApiPageNumber] = useState<number | null>(null)
+
+  // Refs for tracking
   const containerRef = useRef<HTMLDivElement>(null)
   const lastSizeRef = useRef({ width: 0, height: 0 })
-  const stabilityTimerRef = useRef<NodeJS.Timeout | null>(null)
-  const viewerReadyTimerRef = useRef<NodeJS.Timeout | null>(null)
-  const isFirstLoadRef = useRef(true)
   const scrollToFnRef = useRef<((highlight: IHighlight) => void) | null>(null)
   const hasScrolledRef = useRef(false)
+  const citationKeyRef = useRef<string>('')
 
-  // Similarity score function (0-1, where 1 is exact match)
-  const calculateSimilarity = (str1: string, str2: string): number => {
+  // Debug logging - enabled for debugging
+  const addLog = (msg: string) => console.log(`[PDF] ${msg}`)
+
+  // Similarity score function
+  const calculateSimilarity = useCallback((str1: string, str2: string): number => {
     if (str1 === str2) return 1
     if (str1.length === 0 || str2.length === 0) return 0
 
-    // Simple character-based similarity (Dice coefficient)
     const bigrams1 = new Set<string>()
     const bigrams2 = new Set<string>()
 
@@ -64,39 +77,69 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
     })
 
     return (2 * intersection) / (bigrams1.size + bigrams2.size)
-  }
+  }, [])
 
-  // Debug logging (uncomment for debugging)
-  // const [debugLog, setDebugLog] = useState<string[]>([])
-  // const addLog = (msg: string) => setDebugLog(prev => [...prev, `${new Date().toLocaleTimeString()} - ${msg}`])
-  // eslint-disable-next-line no-empty-function
-  const addLog = (_msg: string) => {} // No-op for production
-
-  // Reset highlights when citation changes (chunkId or pageNumber)
-  // This allows new highlights to be applied for the new citation
+  // ============ STEP 1: Reset pipeline when citation changes ============
   useEffect(() => {
-    addLog('🔄 Citation changed, clearing highlights...')
+    const newKey = `${chunkId || 'none'}-${pageNumber || 'none'}`
+
+    // Skip if same citation (but always run on first mount)
+    if (citationKeyRef.current === newKey && citationKeyRef.current !== '') return
+
+    addLog(`🔄 Citation changed: ${newKey}`)
+    citationKeyRef.current = newKey
+
+    // Reset state
     setHighlights([])
     setFullChunkContext(null)
     setApiPageNumber(null)
-    setIsScalingDone(false)
-    setIsViewerReady(false)
-    isFirstLoadRef.current = true // Treat as first load for new citation
-    hasScrolledRef.current = false // Allow scroll for new citation
+    hasScrolledRef.current = false
 
-    // Clear any pending timers
-    if (viewerReadyTimerRef.current) {
-      clearTimeout(viewerReadyTimerRef.current)
-      viewerReadyTimerRef.current = null
-    }
+    // Restart pipeline from container_ready
+    setPipelineStep('container_ready')
   }, [chunkId, pageNumber])
 
-  // Fetch full chunk context from API
+  // ============ STEP 2: Wait for container to have size ============
   useEffect(() => {
-    if (!chunkId) {
-      addLog('⚠️ No chunkId provided')
-      return
+    if (pipelineStep !== 'container_ready') return
+
+    addLog('📦 Step 2: Checking container...')
+
+    const checkContainer = () => {
+      if (!containerRef.current) {
+        addLog('⏳ Container ref not ready, retrying...')
+        setTimeout(checkContainer, 50)
+        return
+      }
+
+      const { width, height } = containerRef.current.getBoundingClientRect()
+      addLog(`📐 Container size: ${width.toFixed(0)}x${height.toFixed(0)}`)
+
+      if (width > 0 && height > 0) {
+        lastSizeRef.current = { width, height }
+        addLog(`✅ Container ready!`)
+
+        // Next step: fetch API data if needed, otherwise go to scaling
+        if (chunkId) {
+          addLog('➡️ Moving to: api_complete')
+          setPipelineStep('api_complete')
+        }
+        else {
+          addLog('➡️ Moving to: scaling_done (no chunkId)')
+          setPipelineStep('scaling_done')
+        }
+      }
+      else {
+        setTimeout(checkContainer, 50)
+      }
     }
+
+    checkContainer()
+  }, [pipelineStep, chunkId])
+
+  // ============ STEP 3: Fetch API data (if chunkId exists) ============
+  useEffect(() => {
+    if (pipelineStep !== 'api_complete' || !chunkId) return
 
     const fetchChunkContext = async () => {
       try {
@@ -106,105 +149,61 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
 
         if (data.chunk_context) {
           setFullChunkContext(data.chunk_context)
-          addLog(`✅ Got chunk: "${data.chunk_context.substring(0, 50)}..."`)
+          addLog('✅ Got chunk context')
 
-          // Notify parent with the full text from API
           if (onFullTextExtracted)
             onFullTextExtracted(data.chunk_context)
         }
-        else {
-          addLog('❌ No chunk_context in response')
-        }
 
-        // Get page number from API response
         if (data.page_numbers && data.page_numbers.length > 0) {
           setApiPageNumber(data.page_numbers[0])
           addLog(`📄 API page number: ${data.page_numbers[0]}`)
         }
+
+        // Next step: scaling
+        setPipelineStep('scaling_done')
       }
       catch (error: any) {
         addLog(`❌ API error: ${error.message}`)
+        // Continue anyway with fallback
+        setPipelineStep('scaling_done')
       }
     }
 
     fetchChunkContext()
-  }, [chunkId, onFullTextExtracted])
+  }, [pipelineStep, chunkId, onFullTextExtracted])
 
-  // Watch for container size changes and re-apply highlights on rescale
+  // ============ STEP 4: Wait for scaling to stabilize ============
   useEffect(() => {
-    if (!containerRef.current) return
+    if (pipelineStep !== 'scaling_done') return
 
-    addLog('👀 Watching for scaling...')
+    addLog('⏳ Waiting for scaling to stabilize...')
 
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0]
-      if (!entry) return
+    // Wait for PDF viewer to stabilize (first load needs more time)
+    const delay = 800
+    const timer = setTimeout(() => {
+      addLog('✅ Scaling complete')
+      setPipelineStep('highlights_ready')
+    }, delay)
 
-      const { width, height } = entry.contentRect
+    return () => clearTimeout(timer)
+  }, [pipelineStep])
 
-      if (stabilityTimerRef.current)
-        clearTimeout(stabilityTimerRef.current)
-
-      if (width !== lastSizeRef.current.width || height !== lastSizeRef.current.height) {
-        lastSizeRef.current = { width, height }
-        addLog(`📐 Size: ${width.toFixed(0)}x${height.toFixed(0)}`)
-
-        // Clear highlights during resize so they can be re-applied
-        setHighlights([])
-        setIsScalingDone(false)
-        setIsViewerReady(false)
-
-        // Clear any pending viewer ready timer
-        if (viewerReadyTimerRef.current) {
-          clearTimeout(viewerReadyTimerRef.current)
-          viewerReadyTimerRef.current = null
-        }
-
-        // Wait for size to stabilize
-        const scalingDelay = isFirstLoadRef.current ? 800 : 300
-        stabilityTimerRef.current = setTimeout(() => {
-          addLog('✅ Scaling complete!')
-          setIsScalingDone(true)
-
-          // Wait additional time for PdfHighlighter viewer to fully initialize
-          // This prevents the "getPageView" crash on first click
-          const viewerDelay = isFirstLoadRef.current ? 600 : 200
-          viewerReadyTimerRef.current = setTimeout(() => {
-            addLog('✅ Viewer ready!')
-            setIsViewerReady(true)
-            isFirstLoadRef.current = false
-          }, viewerDelay)
-          // Don't disconnect - keep watching for future resizes
-        }, scalingDelay)
-      }
-    })
-
-    observer.observe(containerRef.current)
-
-    return () => {
-      observer.disconnect()
-      if (stabilityTimerRef.current)
-        clearTimeout(stabilityTimerRef.current)
-      if (viewerReadyTimerRef.current)
-        clearTimeout(viewerReadyTimerRef.current)
-    }
-  }, [])
-
-  // Apply highlights only after scaling is done AND we have context
+  // ============ STEP 5: Compute highlights ============
   useEffect(() => {
-    // Use fullChunkContext if available, otherwise fall back to searchText
+    if (pipelineStep !== 'highlights_ready') return
+
     const textToSearch = fullChunkContext || searchText
-    if (!isScalingDone || !textToSearch) return
+    if (!textToSearch) {
+      addLog('⚠️ No text to search')
+      setPipelineStep('viewer_ready')
+      return
+    }
 
     const findTextHighlight = async () => {
       try {
-        // Removed: if (highlights.length > 0) return
-        // Now re-applies highlights on each rescale
+        addLog('🚀 Computing highlights...')
 
-        addLog('🚀 Starting text extraction...')
-        addLog(`🔍 Using: ${fullChunkContext ? 'Full chunk context' : 'Search text'}`)
-
-        // Priority: apiPageNumber > pageNumber prop > default 1
         const pageNum = apiPageNumber || (pageNumber ? Number.parseInt(pageNumber) : 1)
         const page = await pdfDocument.getPage(pageNum)
         const viewport = page.getViewport({ scale: 1.0 })
@@ -213,13 +212,11 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
         const items = textContent.items as any[]
         addLog(`📄 Page ${pageNum}: ${items.length} text items`)
 
-        // Simple normalize - just lowercase and normalize spaces
         const normalizeText = (text: string) => text
           .toLowerCase()
           .replace(/\s+/g, ' ')
           .trim()
 
-        // Build full text and track positions (both raw and normalized indices)
         let fullText = ''
         let normalizedText = ''
         const textPositions: Array<{
@@ -248,60 +245,42 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
         })
 
         const normalizedFullText = normalizeText(fullText)
-        addLog(`📝 PDF: "${fullText.substring(0, 60)}..."`)
 
-        // === LINE-BY-LINE ANCHOR-BASED MATCHING ===
-        // Split source text into lines (filter out short lines to avoid false matches)
         const lines = textToSearch.split('\n').filter(l => l.trim().length > 10)
-        addLog(`📝 Source has ${lines.length} lines to match`)
-
-        if (lines.length === 0) {
-          // Fallback: treat entire text as one line if no newlines
+        if (lines.length === 0)
           lines.push(textToSearch)
-        }
 
-        // Find anchor line (longest line - most likely to be unique)
         const anchorLine = lines.reduce((a, b) => a.length > b.length ? a : b)
         const anchorNormalized = normalizeText(anchorLine)
-        addLog(`⚓ Anchor: "${anchorLine.substring(0, 50)}..."`)
 
-        // Find anchor position in PDF
         const anchorIndex = normalizedFullText.indexOf(anchorNormalized)
         let anchorY = 0
         let anchorFound = false
 
-        // Try to find anchor in text positions
         if (anchorIndex !== -1) {
           for (const pos of textPositions) {
             const posNormalized = normalizeText(pos.text)
             if (anchorNormalized.includes(posNormalized) && posNormalized.length > 3) {
               anchorY = pos.transform[5]
               anchorFound = true
-              addLog(`✅ Anchor found at Y=${anchorY.toFixed(0)}`)
               break
             }
           }
         }
 
-        // Fallback: try fuzzy match on anchor
         if (!anchorFound) {
           const anchorFirstWord = anchorNormalized.split(' ')[0]
           for (const pos of textPositions) {
             const posNormalized = normalizeText(pos.text)
-            // Check if first word matches or high similarity
             if (posNormalized.includes(anchorFirstWord) || calculateSimilarity(posNormalized, anchorNormalized) > 0.6) {
               anchorY = pos.transform[5]
               anchorFound = true
-              addLog(`🔄 Anchor fallback at Y=${anchorY.toFixed(0)}`)
               break
             }
           }
         }
 
-        // Proximity threshold: how far (in PDF units) from anchor to consider a match
         const PROXIMITY_THRESHOLD = 300
-
-        // Collect all matched rectangles
         const matchedRects: Array<{
           x1: number
           y1: number
@@ -312,8 +291,7 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
           pageNumber: number
         }> = []
 
-        // Helper function to add a rect if not duplicate
-        const addRect = (pos: typeof textPositions[0], pageNum: number) => {
+        const addRect = (pos: typeof textPositions[0], pNum: number) => {
           const [, , , scaleY, x, y] = pos.transform
           const height = pos.height || Math.abs(scaleY)
           const width = pos.width
@@ -331,49 +309,34 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
               y2: y + height - yOffset,
               width,
               height,
-              pageNumber: pageNum,
+              pageNumber: pNum,
             })
           }
         }
 
-        // Track which lines were matched in first pass
         const matchedLines = new Set<number>()
 
-        // ============ FIRST PASS: Full sentence matching (strict) ============
-        // Try to find each full sentence in the concatenated PDF text
-        addLog('📝 First pass: Full sentence matching...')
-
+        // First pass: Full sentence matching
         for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
           const line = lines[lineIdx]
           const lineNormalized = normalizeText(line)
 
-          // Skip very short lines
           if (lineNormalized.length < 20)
             continue
 
-          // Check if this full sentence exists in the PDF text
           const sentenceIndex = normalizedFullText.indexOf(lineNormalized)
 
           if (sentenceIndex !== -1) {
             matchedLines.add(lineIdx)
-            addLog(`✅ Line ${lineIdx + 1} matched fully`)
-
-            // Find all text positions that fall within this sentence range
             const sentenceEnd = sentenceIndex + lineNormalized.length
 
             for (const pos of textPositions) {
               const posY = pos.transform[5]
-
-              // Skip if too far from anchor
               if (anchorFound && Math.abs(posY - anchorY) > PROXIMITY_THRESHOLD)
                 continue
 
-              // Check if this text item overlaps with the sentence position (using normalized indices)
               const posStart = pos.normalizedIndex
               const posEnd = pos.normalizedIndex + normalizeText(pos.text).length + 1
-
-              // Check for any overlap between text item and sentence range
-              // This captures items that: start within, end within, or span the range
               const hasOverlap = posStart < sentenceEnd + 5 && posEnd > sentenceIndex - 2
 
               if (hasOverlap)
@@ -382,13 +345,10 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
           }
         }
 
-        // ============ SECOND PASS: Fragment matching for unmatched lines ============
-        addLog(`📝 Second pass: Fragment matching for ${lines.length - matchedLines.size} unmatched lines...`)
-
+        // Second pass: Fragment matching
         const SIMILARITY_THRESHOLD = 0.80
 
         for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-          // Skip lines that matched in first pass
           if (matchedLines.has(lineIdx))
             continue
 
@@ -400,28 +360,23 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
             const posNormalized = normalizeText(pos.text)
             const posY = pos.transform[5]
 
-            // Skip if too far from anchor
             if (anchorFound && Math.abs(posY - anchorY) > PROXIMITY_THRESHOLD)
               continue
 
-            // Skip very short text items
             if (posNormalized.length < 3)
               continue
 
             let isMatch = false
 
-            // Strategy 1: PDF fragment (5+ chars) is contained in source line
             if (posNormalized.length >= 5 && lineNormalized.includes(posNormalized))
               isMatch = true
 
-            // Strategy 2: Fuzzy similarity for longer PDF items (15+ chars)
             if (!isMatch && posNormalized.length >= 15) {
               const similarity = calculateSimilarity(posNormalized, lineNormalized)
               if (similarity >= SIMILARITY_THRESHOLD)
                 isMatch = true
             }
 
-            // Strategy 3: Multiple unique words (6+ chars) match
             if (!isMatch && lineWords.length >= 2) {
               const matchingWords = lineWords.filter(word => posNormalized.includes(word))
               if (matchingWords.length >= 2)
@@ -433,11 +388,8 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
           }
         }
 
-        // ============ THIRD PASS: Fill gaps between first and last match ============
-        // If we have matches, highlight everything between the first and last Y position
+        // Third pass: Fill gaps
         if (matchedRects.length > 0) {
-          addLog('📝 Third pass: Filling gaps between matches...')
-
           const minY = Math.min(...matchedRects.map(r => r.y1))
           const maxY = Math.max(...matchedRects.map(r => r.y2))
 
@@ -446,23 +398,16 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
             const [, , , scaleY, , y] = pos.transform
             const height = pos.height || Math.abs(scaleY)
 
-            // Skip very short or empty text
             if (posText.length < 2)
               continue
 
-            // Check if this text item is between the first and last match (by Y position)
-            // Add some tolerance for line height
             const posTop = y - height * 0.15
             const posBottom = y + height - height * 0.15
 
-            if (posTop >= minY - 5 && posBottom <= maxY + 5) {
-              // This text is in the range, add it if not already added
+            if (posTop >= minY - 5 && posBottom <= maxY + 5)
               addRect(pos, pageNum)
-            }
           }
         }
-
-        addLog(`📦 Found ${matchedRects.length} rects from ${lines.length} lines`)
 
         if (matchedRects.length > 0) {
           const boundingRect = {
@@ -488,55 +433,91 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
           }
 
           setHighlights([newHighlight])
-          addLog('🎉 Highlight applied!')
+          addLog('🎉 Highlights computed!')
         }
-        else {
-          addLog('❌ No matching rects found')
-        }
+
+        // Next step: viewer ready
+        setPipelineStep('viewer_ready')
       }
       catch (error: any) {
         console.error('Error finding highlights:', error)
         addLog(`❌ Error: ${error.message}`)
+        setPipelineStep('viewer_ready')
       }
     }
 
     findTextHighlight()
-  }, [pdfDocument, searchText, pageNumber, isScalingDone, fullChunkContext, apiPageNumber, calculateSimilarity])
+  }, [pipelineStep, pdfDocument, searchText, pageNumber, fullChunkContext, apiPageNumber, calculateSimilarity])
 
-  // Scroll to highlight when viewer is ready and highlights are set
+  // ============ STEP 6: Wait for viewer to be ready, then scroll ============
   useEffect(() => {
-    if (!isViewerReady || highlights.length === 0 || hasScrolledRef.current)
-      return
+    if (pipelineStep !== 'viewer_ready') return
 
-    // Small delay to ensure the highlight is rendered
-    const scrollTimer = setTimeout(() => {
-      if (scrollToFnRef.current && highlights[0]) {
+    addLog('⏳ Waiting for viewer to initialize...')
+
+    const timer = setTimeout(() => {
+      addLog('✅ Viewer ready')
+
+      // Scroll to highlight if we have one
+      if (highlights.length > 0 && scrollToFnRef.current && !hasScrolledRef.current) {
         addLog('📜 Scrolling to highlight...')
         scrollToFnRef.current(highlights[0])
         hasScrolledRef.current = true
       }
-    }, 100)
 
-    return () => clearTimeout(scrollTimer)
-  }, [isViewerReady, highlights])
+      setPipelineStep('complete')
+    }, 600)
+
+    return () => clearTimeout(timer)
+  }, [pipelineStep, highlights])
+
+  // ============ Handle resize - restart from scaling step ============
+  useEffect(() => {
+    if (!containerRef.current || pipelineStep === 'init') return
+
+    let resizeTimer: NodeJS.Timeout | null = null
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0]
+      if (!entry) return
+
+      const { width, height } = entry.contentRect
+      if (width === 0 || height === 0) return
+
+      // Only restart if size changed significantly
+      if (Math.abs(width - lastSizeRef.current.width) > 10
+          || Math.abs(height - lastSizeRef.current.height) > 10) {
+        lastSizeRef.current = { width, height }
+
+        if (resizeTimer)
+          clearTimeout(resizeTimer)
+
+        // Debounce resize - restart from scaling step
+        resizeTimer = setTimeout(() => {
+          if (pipelineStep === 'complete') {
+            addLog('📐 Resize detected, recomputing...')
+            setHighlights([])
+            hasScrolledRef.current = false
+            setPipelineStep('scaling_done')
+          }
+        }, 300)
+      }
+    })
+
+    observer.observe(containerRef.current)
+
+    return () => {
+      observer.disconnect()
+      if (resizeTimer)
+        clearTimeout(resizeTimer)
+    }
+  }, [pipelineStep])
 
   return (
     <div className='flex h-full w-full flex-col'>
-      {/* Debug Panel - uncomment to debug
-      <div className='shrink-0 border-b border-gray-200 bg-gray-50 p-2'>
-        <div className='flex items-center gap-2 text-xs'>
-          <span className='font-medium'>Debug:</span>
-          <span>Scaling: {isScalingDone ? '✅' : '⏳'}</span>
-          <span>Highlights: {highlights.length}</span>
-        </div>
-        <div className='mt-1 max-h-20 overflow-y-auto rounded border border-gray-200 bg-white p-1 font-mono text-xs'>
-          {debugLog.map((log, i) => (
-            <div key={i} className='text-gray-600'>{log}</div>
-          ))}
-        </div>
-      </div>
-      */}
-      {/* PDF Viewer */}
+      {/* Inject CSS override for highlight color */}
+      <style dangerouslySetInnerHTML={{ __html: highlightColorStyle }} />
+      {/* PDF Viewer - always rendered, no conditional */}
       <div ref={containerRef} className='min-h-0 flex-1'>
         <PdfHighlighter
           pdfDocument={pdfDocument}
@@ -556,7 +537,7 @@ const PdfHighlighterWrapper: FC<PdfHighlighterWrapperProps> = ({
               comment={highlight.comment}
             />
           )}
-          highlights={isViewerReady ? highlights : []}
+          highlights={pipelineStep === 'complete' ? highlights : []}
         />
       </div>
     </div>
