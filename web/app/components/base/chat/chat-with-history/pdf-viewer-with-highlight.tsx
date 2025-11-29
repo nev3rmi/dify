@@ -401,6 +401,13 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
   console.log('[PDF] PdfHighlighterStable render, hasRendered:', hasRendered.current)
 
+  // Reset highlights when chunkContext changes (new citation clicked)
+  useEffect(() => {
+    console.log('[PDF] ChunkContext changed, resetting highlights')
+    hasHighlightedRef.current = false
+    setHighlights([])
+  }, [chunkContext])
+
   // Similarity scoring function (bigram)
   const calculateSimilarity = useCallback((str1: string, str2: string): number => {
     if (str1 === str2) return 1
