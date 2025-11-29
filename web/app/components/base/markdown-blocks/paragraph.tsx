@@ -1,26 +1,22 @@
 /**
  * @fileoverview Paragraph component for rendering <p> tags in Markdown.
- * Extracted from the main markdown renderer for modularity.
- * Handles special rendering for paragraphs that directly contain an image.
+ * Uses <div> instead of <p> to avoid hydration errors when images are present,
+ * since images render as block elements (ImageGallery uses div).
  */
 import React from 'react'
-import ImageGallery from '@/app/components/base/image-gallery'
 
 const Paragraph = (paragraph: any) => {
   const { node }: any = paragraph
-  const children_node = node.children
-  if (children_node && children_node[0] && 'tagName' in children_node[0] && children_node[0].tagName === 'img') {
-    return (
-      <div className="markdown-img-wrapper">
-        <ImageGallery srcs={[children_node[0].properties.src]} />
-        {
-          Array.isArray(paragraph.children) && paragraph.children.length > 1 && (
-            <div className="mt-2">{paragraph.children.slice(1)}</div>
-          )
-        }
-      </div>
-    )
-  }
+  const children_node = node?.children
+
+  // Check if any child is an img tag - these render as block elements (div)
+  // so we can't use <p> which doesn't allow nested block elements
+  const hasImage = children_node?.some((child: any) => child.tagName === 'img')
+
+  // Use div for paragraphs with images to avoid hydration errors
+  if (hasImage)
+    return <div className="mb-4">{paragraph.children}</div>
+
   return <p>{paragraph.children}</p>
 }
 

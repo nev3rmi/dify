@@ -1,0 +1,14 @@
+/* Fix double rendering caused by text layer blend mode */
+.textLayer {
+  opacity: 0 !important;
+  mix-blend-mode: normal !important;
+}
+
+/* Make text visible only when selecting */
+.textLayer::selection {
+  opacity: 1 !important;
+}
+
+.textLayer span {
+  mix-blend-mode: normal !important;
+}
