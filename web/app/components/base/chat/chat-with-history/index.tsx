@@ -169,7 +169,24 @@ const ChatWithHistory: FC<ChatWithHistoryProps> = ({
                 <div className='mt-3 shrink-0 rounded-lg border border-divider-subtle bg-gray-50 p-3'>
                   <div className='mb-1 text-xs font-medium text-text-tertiary'>Source Text</div>
                   <div className='max-h-32 overflow-y-auto text-xs text-text-secondary'>
-                    {previewData.fullText || previewData.sourceText}
+                    {(() => {
+                      const text = previewData.fullText || previewData.sourceText || ''
+                      const blocks = text
+                        .split('\n')
+                        .map(s => s.trim())
+                        .filter(s => s.length > 10)
+                      const uniqueBlocks = [...new Set(blocks)]
+
+                      return (
+                        <div className='space-y-2'>
+                          {uniqueBlocks.map((block, idx) => (
+                            <div key={idx} className='rounded bg-white p-2 border-l-2 border-blue-400'>
+                              <span className='font-semibold text-blue-600'>Block {idx + 1}:</span> {block}
+                            </div>
+                          ))}
+                        </div>
+                      )
+                    })()}
                   </div>
                 </div>
               )}
