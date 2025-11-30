@@ -547,6 +547,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
   const hasExtractedPageRef = useRef<number | null>(null)
   const [scale, setScale] = useState<string | null>(null)
   const [highlights, setHighlights] = useState<IHighlight[]>([])
+  const [viewerReady, setViewerReady] = useState(false)
 
   // Page text map with line boxes
   interface LineGroup {
@@ -567,13 +568,19 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     fullText: string
   } | null>(null)
 
-  console.log('[PDF] PdfHighlighterStable render, hasRendered:', hasRendered.current)
+  console.log('[PDF] PdfHighlighterStable render:', {
+    hasRendered: hasRendered.current,
+    scale,
+    highlightsCount: highlights.length,
+    hasPageTextMap: !!pageTextMap,
+  })
 
   // Reset highlights when chunkContext changes (new citation clicked)
   useEffect(() => {
     console.log('[PDF] ChunkContext changed, resetting highlights')
     hasHighlightedRef.current = false
     hasExtractedPageRef.current = null
+    setViewerReady(false)
     setHighlights([])
     setPageTextMap(null)
   }, [chunkContext])
@@ -601,8 +608,9 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
   }, [])
 
   // Calculate fixed scale once on mount to prevent feedback loop
+  const hasCalculatedScaleRef = useRef(false)
   useEffect(() => {
-    if (!pdfDocument) return
+    if (!pdfDocument || hasCalculatedScaleRef.current) return
 
     const calculateScale = async () => {
       try {
@@ -613,16 +621,23 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         // Round DOWN to 2 decimal places to prevent overflow
         const roundedScale = Math.floor(calculatedScale * 100) / 100
         setScale(roundedScale.toString())
-        console.log(`[PDF] Fixed scale: ${roundedScale} (container: ${containerWidth}px, page: ${viewport.width}px)`)
+        hasCalculatedScaleRef.current = true
+        console.log(`[PDF] ✅ Scale calculated ONCE: ${roundedScale} (container: ${containerWidth}px, page: ${viewport.width}px)`)
       }
       catch (e) {
         console.log('[PDF] Scale calculation failed, using default')
         setScale('1.0')
+        hasCalculatedScaleRef.current = true
       }
     }
 
     calculateScale()
   }, [pdfDocument, containerWidth])
+
+  // Reset scale calculation when chunk changes
+  useEffect(() => {
+    hasCalculatedScaleRef.current = false
+  }, [chunkContext])
 
   useEffect(() => {
     if (!hasCalledReady.current && scale !== null) {
@@ -697,10 +712,15 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
       hasChunkContext: !!chunkContext,
       hasPdfDoc: !!pdfDocument,
       hasPageTextMap: !!pageTextMap,
+      hasRendered: hasRendered.current,
+      viewerReady,
       hasHighlighted: hasHighlightedRef.current,
     })
 
-    if (!isFullyReady || !chunkContext || !pdfDocument || !pageTextMap || hasHighlightedRef.current) return
+    // Wait for PdfHighlighter's internal viewer to be ready
+    if (!isFullyReady || !chunkContext || !pdfDocument || !pageTextMap || !hasRendered.current || !viewerReady || hasHighlightedRef.current) return
+
+    console.log('[PDF] ✅ All dependencies ready, starting highlighting...')
     hasHighlightedRef.current = true
 
     const findHighlights = async () => {
@@ -817,15 +837,18 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
           comment: { text: '', emoji: '' },
         }
 
-        setHighlights([newHighlight])
-        console.log(`[PDF] 🎉 Created highlight with ${allMatchedRects.length} rects`)
-        console.log(`[PDF] Highlight object:`, newHighlight)
+        // Disable auto-scroll for testing
+        const highlightWithoutScroll = {
+          ...newHighlight,
+          position: {
+            ...newHighlight.position,
+            scrollIntoView: false, // Disable scroll
+          },
+        }
 
-        // Force re-render by updating highlights again after a small delay
-        setTimeout(() => {
-          setHighlights([newHighlight])
-          console.log(`[PDF] 🔄 Force re-rendered highlights`)
-        }, 100)
+        setHighlights([highlightWithoutScroll])
+        console.log(`[PDF] 🎉 Created highlight with ${allMatchedRects.length} rects (scroll disabled)`)
+        console.log(`[PDF] Highlight object:`, highlightWithoutScroll)
       }
       catch (error: any) {
         console.error('[PDF] ❌ Highlight error:', error)
@@ -1468,7 +1491,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     // }
     //
     // findHighlights()
-  }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, pageTextMap, normalizeWithSpaces])
+  }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, pageTextMap, viewerReady, normalizeWithSpaces, calculateSimilarity])
 
   // Extract full text from API page WITH positions
   useEffect(() => {
@@ -1586,15 +1609,17 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         }
 
         // Store text map with lines
-        setPageTextMap({
+        const textMap = {
           items: textItems,
           lines: lineGroups.map(lg => ({ y: lg.y, text: lg.text, box: lg.box })),
           fullText,
-        })
+        }
 
+        setPageTextMap(textMap)
         hasExtractedPageRef.current = apiPageNumber
 
         console.log(`[PDF] 📝 Page ${apiPageNumber} text map: ${textItems.length} items, ${lineGroups.length} lines`)
+        console.log(`[PDF] ✅ pageTextMap state updated - this should trigger highlighting now`)
         console.log(`[PDF] 📦 ALL sentence boxes with positions (${lineGroups.length} lines):`)
         lineGroups.forEach((line, idx) => {
           const box = line.box
@@ -1616,14 +1641,11 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
   // No manual scrolling needed - the highlight's pageNumber triggers auto-scroll
 
   // Memoize callbacks to prevent PdfHighlighter re-renders
-
-  // Note: When highlights are enabled, PdfHighlighter auto-scrolls to show highlights
-  // No manual scrolling needed - the highlight's pageNumber triggers auto-scroll
-
-  // Memoize callbacks to prevent PdfHighlighter re-renders
   const enableAreaSelection = useCallback(() => false, [])
   const scrollRef = useCallback(() => {
-    // No-op: we're using temporary highlights for scrolling instead
+    // This callback fires when PdfHighlighter's viewer is fully initialized
+    setViewerReady(true)
+    console.log('[PDF] ✅ PdfHighlighter viewer is ready (scrollRef callback fired)')
   }, [])
   const onScrollChange = useCallback(() => {}, [])
   const onSelectionFinished = useCallback(() => null, [])
@@ -1631,14 +1653,30 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
   // Render highlights using built-in Highlight component
   const highlightTransform = useCallback(
     (highlight: any, _index: number, _setTip: any, _hideTip: any, _viewportToScaled: any, _screenshot: any, isScrolledTo: boolean) => {
-      console.log('[PDF] Rendering highlight:', highlight.id, 'isScrolledTo:', isScrolledTo)
+      console.log('[PDF] highlightTransform called:', {
+        id: highlight.id,
+        isScrolledTo,
+        rectsCount: highlight.position.rects.length,
+        pageNumber: highlight.position.pageNumber,
+      })
+
+      // Add test styling to make highlight more visible
       return (
-        <Highlight
-          key={highlight.id}
-          isScrolledTo={isScrolledTo}
-          position={highlight.position}
-          comment={highlight.comment}
-        />
+        <div
+          style={{
+            background: 'rgba(255, 226, 143, 0.8)',
+            border: '2px solid red',
+            position: 'absolute',
+          }}
+          onClick={() => console.log('[PDF] Highlight clicked!')}
+        >
+          <Highlight
+            key={highlight.id}
+            isScrolledTo={isScrolledTo}
+            position={highlight.position}
+            comment={highlight.comment}
+          />
+        </div>
       )
     },
     []
@@ -1660,7 +1698,6 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
       {/* Inject CSS for yellow highlights */}
       <style dangerouslySetInnerHTML={{ __html: highlightColorStyle }} />
       <PdfHighlighter
-        key={`highlighter-${highlights.length > 0 ? highlights[0].id : 'empty'}`}
         pdfDocument={pdfDocument}
         enableAreaSelection={enableAreaSelection}
         scrollRef={scrollRef}
