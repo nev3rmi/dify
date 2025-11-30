@@ -77,28 +77,6 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     setPageTextMap(null)
   }, [chunkContext])
 
-  // Similarity scoring function (bigram)
-  const calculateSimilarity = useCallback((str1: string, str2: string): number => {
-    if (str1 === str2) return 1
-    if (str1.length === 0 || str2.length === 0) return 0
-
-    const bigrams1 = new Set<string>()
-    const bigrams2 = new Set<string>()
-
-    for (let i = 0; i < str1.length - 1; i++)
-      bigrams1.add(str1.substring(i, i + 2))
-
-    for (let i = 0; i < str2.length - 1; i++)
-      bigrams2.add(str2.substring(i, i + 2))
-
-    let intersection = 0
-    bigrams1.forEach((bigram) => {
-      if (bigrams2.has(bigram)) intersection++
-    })
-
-    return (2 * intersection) / (bigrams1.size + bigrams2.size)
-  }, [])
-
   // Calculate fixed scale once on mount to prevent feedback loop
   const hasCalculatedScaleRef = useRef(false)
   useEffect(() => {
@@ -138,8 +116,41 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     }
   }, [onReady, scale])
 
-  // Normalization helper for fuzzy line matching
+  // Normalization helper
   const normalizeWithSpaces = useCallback((text: string) => text.toLowerCase().replace(/\s+/g, ' ').trim(), [])
+
+  // Levenshtein distance for better similarity matching
+  const levenshteinDistance = useCallback((str1: string, str2: string): number => {
+    const len1 = str1.length
+    const len2 = str2.length
+    const matrix: number[][] = []
+
+    for (let i = 0; i <= len1; i++)
+      matrix[i] = [i]
+
+    for (let j = 0; j <= len2; j++)
+      matrix[0][j] = j
+
+    for (let i = 1; i <= len1; i++) {
+      for (let j = 1; j <= len2; j++) {
+        const cost = str1[i - 1] === str2[j - 1] ? 0 : 1
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j] + 1, // deletion
+          matrix[i][j - 1] + 1, // insertion
+          matrix[i - 1][j - 1] + cost, // substitution
+        )
+      }
+    }
+
+    return matrix[len1][len2]
+  }, [])
+
+  // Calculate similarity score from Levenshtein distance (0-1, higher is better)
+  const calculateLevenshteinSimilarity = useCallback((str1: string, str2: string): number => {
+    const distance = levenshteinDistance(str1, str2)
+    const maxLength = Math.max(str1.length, str2.length)
+    return maxLength === 0 ? 1 : 1 - distance / maxLength
+  }, [levenshteinDistance])
 
   // Find and create highlights when everything is ready
   useEffect(() => {
@@ -160,7 +171,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     hasHighlightedRef.current = true
 
     const findHighlights = async () => {
-      console.log('[PDF] 🚀 Starting simple fuzzy matching...')
+      console.log('[PDF] 🚀 Starting sliding window + Levenshtein matching...')
       console.log('[PDF] Chunk context:', chunkContext.substring(0, 200))
 
       try {
@@ -176,52 +187,42 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
         const allMatchedRects: Array<{ x1: number; y1: number; x2: number; y2: number; width: number; height: number; pageNumber: number }> = []
 
-        // Match each chunk block against PDF lines using fuzzy matching
+        // Match each chunk block using sliding window approach
         for (let i = 0; i < chunkBlocks.length; i++) {
           const block = chunkBlocks[i]
           const blockNormalized = normalizeWithSpaces(block)
 
           console.log(`[PDF]   Block ${i + 1}: "${block.substring(0, 60)}..."`)
 
-          const matchedLines: typeof pageTextMap.lines = []
+          let bestMatch: { lines: typeof pageTextMap.lines, score: number } | null = null
 
-          // Try finding matching lines using similarity
-          for (const line of pageTextMap.lines) {
-            const lineNormalized = normalizeWithSpaces(line.text)
+          // Try windows of 1-5 consecutive PDF lines
+          for (let windowSize = 1; windowSize <= Math.min(5, pageTextMap.lines.length); windowSize++) {
+            for (let startIdx = 0; startIdx <= pageTextMap.lines.length - windowSize; startIdx++) {
+              const windowLines = pageTextMap.lines.slice(startIdx, startIdx + windowSize)
+              const windowText = normalizeWithSpaces(windowLines.map(l => l.text).join(' '))
 
-            // Check 1: Exact substring
-            if (blockNormalized.includes(lineNormalized) && lineNormalized.length >= 10) {
-              matchedLines.push(line)
-              continue
+              // Calculate similarity using Levenshtein distance
+              const similarity = calculateLevenshteinSimilarity(blockNormalized, windowText)
+
+              // Also check exact substring match
+              const isSubstring = windowText.includes(blockNormalized) || blockNormalized.includes(windowText)
+
+              // Score: prefer exact match, otherwise use similarity
+              const score = isSubstring ? 1.0 : similarity
+
+              if (!bestMatch || score > bestMatch.score)
+                bestMatch = { lines: windowLines, score }
             }
-
-            // Check 2: Line is substring of block
-            if (lineNormalized.includes(blockNormalized) && blockNormalized.length >= 10) {
-              matchedLines.push(line)
-              continue
-            }
-
-            // Check 3: High similarity (using our bigram function)
-            if (lineNormalized.length >= 20 && blockNormalized.length >= 20) {
-              const similarity = calculateSimilarity(lineNormalized, blockNormalized)
-              if (similarity >= 0.7) {
-                matchedLines.push(line)
-                continue
-              }
-            }
-
-            // Check 4: Many shared words
-            const blockWords = blockNormalized.split(' ').filter(w => w.length >= 5)
-            const lineWords = lineNormalized.split(' ').filter(w => w.length >= 5)
-            const sharedWords = blockWords.filter(w => lineWords.includes(w))
-            if (sharedWords.length >= 3 && sharedWords.length >= blockWords.length * 0.5)
-              matchedLines.push(line)
           }
 
-          if (matchedLines.length > 0) {
-            console.log(`[PDF]       ✓ Matched ${matchedLines.length} lines:`)
-            // Create rects from matched lines (full line box)
-            for (const line of matchedLines) {
+          // Accept match if score > 0.75
+          const threshold = 0.75
+          if (bestMatch && bestMatch.score >= threshold) {
+            console.log(`[PDF]       ✓ Matched ${bestMatch.lines.length} consecutive lines (score: ${bestMatch.score.toFixed(2)}):`)
+
+            // Create rects from matched lines
+            for (const line of bestMatch.lines) {
               const lineIdx = pageTextMap.lines.indexOf(line)
               console.log(`[PDF]           Line ${lineIdx + 1}: "${line.text.substring(0, 60)}..."`)
 
@@ -238,7 +239,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
             }
           }
           else {
-            console.log('[PDF]       ✗ No matching lines found')
+            console.log(`[PDF]       ✗ No match found (best score: ${bestMatch?.score.toFixed(2) || '0.00'})`)
           }
         }
 
@@ -291,7 +292,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     }
 
     findHighlights()
-  }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, pageTextMap, normalizeWithSpaces, calculateSimilarity])
+  }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, pageTextMap, normalizeWithSpaces, calculateLevenshteinSimilarity])
 
   // Extract full text from API page WITH positions
   useEffect(() => {
