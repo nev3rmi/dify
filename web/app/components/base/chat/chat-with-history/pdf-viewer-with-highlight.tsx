@@ -692,6 +692,14 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
   // Find and create highlights when everything is ready
   useEffect(() => {
+    console.log('[PDF] Highlight check:', {
+      isFullyReady,
+      hasChunkContext: !!chunkContext,
+      hasPdfDoc: !!pdfDocument,
+      hasPageTextMap: !!pageTextMap,
+      hasHighlighted: hasHighlightedRef.current,
+    })
+
     if (!isFullyReady || !chunkContext || !pdfDocument || !pageTextMap || hasHighlightedRef.current) return
     hasHighlightedRef.current = true
 
