@@ -819,6 +819,13 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
         setHighlights([newHighlight])
         console.log(`[PDF] 🎉 Created highlight with ${allMatchedRects.length} rects`)
+        console.log(`[PDF] Highlight object:`, newHighlight)
+
+        // Force re-render by updating highlights again after a small delay
+        setTimeout(() => {
+          setHighlights([newHighlight])
+          console.log(`[PDF] 🔄 Force re-rendered highlights`)
+        }, 100)
       }
       catch (error: any) {
         console.error('[PDF] ❌ Highlight error:', error)
@@ -1653,6 +1660,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
       {/* Inject CSS for yellow highlights */}
       <style dangerouslySetInnerHTML={{ __html: highlightColorStyle }} />
       <PdfHighlighter
+        key={`highlighter-${highlights.length > 0 ? highlights[0].id : 'empty'}`}
         pdfDocument={pdfDocument}
         enableAreaSelection={enableAreaSelection}
         scrollRef={scrollRef}
