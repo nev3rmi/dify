@@ -407,6 +407,7 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
   const [pdfLoaded, setPdfLoaded] = useState(false)
   const [apiLoaded, setApiLoaded] = useState(false)
   const [fullChunkContext, setFullChunkContext] = useState<string | null>(null)
+  const [apiPageNumber, setApiPageNumber] = useState<number | null>(null)
   const hasFetchedRef = useRef<string | null>(null)
   const onFullTextExtractedRef = useRef(onFullTextExtracted)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -436,6 +437,8 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
     hasFetchedRef.current = chunkId
 
     setApiLoaded(false)
+    setFullChunkContext(null)
+    setApiPageNumber(null)
     const fetchChunkContext = async () => {
       console.log(`[PDF] Fetching chunk ${chunkId}...`)
       try {
@@ -445,11 +448,22 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
 
         if (text) {
           const data = JSON.parse(text)
+          console.log(`[PDF] API data:`, data)
+
           if (data.chunk_context) {
-            setFullChunkContext(data.chunk_context)
-            console.log(`[PDF] Got context: ${data.chunk_context.length} chars`)
+            // Handle double-encoded JSON string
+            let chunkText = data.chunk_context
+            if (typeof chunkText === 'string' && chunkText.startsWith('"') && chunkText.endsWith('"')) {
+              chunkText = JSON.parse(chunkText) // Parse the inner JSON string
+            }
+            setFullChunkContext(chunkText)
+            console.log(`[PDF] Got context: ${chunkText.length} chars`)
             if (onFullTextExtractedRef.current)
-              onFullTextExtractedRef.current(data.chunk_context)
+              onFullTextExtractedRef.current(chunkText)
+          }
+          if (data.page_numbers && data.page_numbers.length > 0) {
+            setApiPageNumber(data.page_numbers[0])
+            console.log(`[PDF] API page number: ${data.page_numbers[0]}`)
           }
         }
       }
@@ -507,6 +521,7 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
               containerWidth={containerRef.current?.clientWidth || 600}
               chunkContext={fullChunkContext}
               isFullyReady={isReady}
+              apiPageNumber={apiPageNumber}
             />
           )}
         </PdfLoader>
@@ -522,9 +537,10 @@ type PdfHighlighterStableProps = {
   containerWidth: number
   chunkContext: string | null
   isFullyReady: boolean
+  apiPageNumber: number | null
 }
 
-const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onReady, containerWidth, chunkContext, isFullyReady }) => {
+const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onReady, containerWidth, chunkContext, isFullyReady, apiPageNumber }) => {
   const hasCalledReady = useRef(false)
   const hasRendered = useRef(false)
   const hasHighlightedRef = useRef(false)
@@ -662,7 +678,10 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
       console.log('[PDF] Source text from n8n API:', chunkContext.substring(0, 200))
 
       try {
-        const pageNum = 1 // Start with page 1
+        // Use API page number if available, otherwise default to page 1
+        const pageNum = apiPageNumber || 1
+        console.log(`[PDF] 📄 Using page ${pageNum} (API: ${apiPageNumber || 'not set'})`)
+
         const page = await pdfDocument.getPage(pageNum)
         const viewport = page.getViewport({ scale: 1.0 })
         const textContent = await page.getTextContent()
@@ -688,8 +707,17 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         const uniqueBlocks = [...new Set(allBlocks)]
         console.log(`[PDF] 📝 ${allBlocks.length} blocks → ${uniqueBlocks.length} unique blocks`)
 
-        // Match each block independently and accumulate ALL rects
+        // Match each block independently and accumulate ALL rects with metadata
+        interface MatchedBlock {
+          blockIndex: number
+          blockText: string
+          rects: Array<{ x1: number; y1: number; x2: number; y2: number; width: number; height: number; pageNumber: number }>
+          method: string
+          yRange: { min: number; max: number }
+        }
+
         const allMatchedRects: Array<{ x1: number; y1: number; x2: number; y2: number; width: number; height: number; pageNumber: number }> = []
+        const matchedBlocks: MatchedBlock[] = []
         let totalMatched = 0
         let totalTokens = 0
 
@@ -744,65 +772,175 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
             }
           }
 
-          // PASS 1: Try sentence matching (dual normalization)
+          // ========== PHASE 1: ACCUMULATIVE MATCHING ==========
           let blockRects: Array<{ x1: number; y1: number; x2: number; y2: number; width: number; height: number; pageNumber: number }> = []
           let matchMethod = ''
 
-          // Try with spaces first
+          // PASS 1a: Sentence with spaces
           const normalizedBlock = normalizeWithSpaces(block)
           let sentenceIndex = fullTextWithSpaces.indexOf(normalizedBlock)
 
           if (sentenceIndex !== -1) {
-            matchMethod = 'sentence (with spaces)'
-            // Find all text positions that overlap with this sentence
+            matchMethod = 'sentence'
             const sentenceEnd = sentenceIndex + normalizedBlock.length
 
             for (const pos of textPositions) {
               const posNormalized = normalizeWithSpaces(pos.text)
               const posStart = pos.startIndexWithSpaces
-              const posEnd = posStart + posNormalized.length + 1 // +1 for space
+              const posEnd = posStart + posNormalized.length + 1
 
-              // Check overlap
               if (posStart < sentenceEnd + 5 && posEnd > sentenceIndex - 2) {
                 blockRects.push(createRectFromPosition(pos, pageNum))
               }
             }
+            console.log(`[PDF]       ✓ Sentence (spaces): +${blockRects.length} rects`)
           }
 
-          // Try without spaces if first attempt failed
-          if (blockRects.length === 0) {
-            const normalizedBlockNoSpaces = normalizeNoSpaces(block)
-            sentenceIndex = fullTextNoSpaces.indexOf(normalizedBlockNoSpaces)
+          // PASS 1b: Sentence without spaces (ACCUMULATE - may add more rects)
+          const normalizedBlockNoSpaces = normalizeNoSpaces(block)
+          const sentenceIndexNoSpaces = fullTextNoSpaces.indexOf(normalizedBlockNoSpaces)
 
-            if (sentenceIndex !== -1) {
-              matchMethod = 'sentence (no spaces)'
-              const sentenceEnd = sentenceIndex + normalizedBlockNoSpaces.length
+          if (sentenceIndexNoSpaces !== -1) {
+            const sentenceRectsNoSpaces: typeof blockRects = []
+            const sentenceEnd = sentenceIndexNoSpaces + normalizedBlockNoSpaces.length
 
-              for (const pos of textPositions) {
-                const posNormalized = normalizeNoSpaces(pos.text)
-                const posStart = pos.startIndexNoSpaces
-                const posEnd = posStart + posNormalized.length
+            for (const pos of textPositions) {
+              const posNormalized = normalizeNoSpaces(pos.text)
+              const posStart = pos.startIndexNoSpaces
+              const posEnd = posStart + posNormalized.length
 
-                // Check overlap
-                if (posStart < sentenceEnd + 3 && posEnd > sentenceIndex - 1) {
-                  blockRects.push(createRectFromPosition(pos, pageNum))
-                }
+              if (posStart < sentenceEnd + 3 && posEnd > sentenceIndexNoSpaces - 1) {
+                sentenceRectsNoSpaces.push(createRectFromPosition(pos, pageNum))
               }
+            }
+
+            if (sentenceRectsNoSpaces.length > 0) {
+              console.log(`[PDF]       ✓ Sentence (no spaces): +${sentenceRectsNoSpaces.length} rects`)
+              blockRects.push(...sentenceRectsNoSpaces)
+              if (matchMethod === '') matchMethod = 'sentence'
+              else if (!matchMethod.includes('sentence')) matchMethod += '+sentence'
             }
           }
 
-          // PASS 2: Fall back to token matching if sentence matching failed
-          if (blockRects.length === 0) {
-            matchMethod = 'token'
+          // PASS 2: Multi-word anchor search (ACCUMULATE)
+          const anchorRects: typeof blockRects = []
+          {
+            const anchorMethod = 'anchor'
+            const normalizedBlock = normalizeWithSpaces(block)
+            const words = normalizedBlock.split(' ').filter(w => w.length > 0)
+
+            // Extract 4-5 word anchor phrases
+            const anchorSize = 4
+            const anchors: string[] = []
+            for (let j = 0; j <= words.length - anchorSize; j++) {
+              anchors.push(words.slice(j, j + anchorSize).join(' '))
+            }
+
+            // Search for any anchor in full text
+            let anchorFound = false
+            for (const anchor of anchors) {
+              const anchorIndex = fullTextWithSpaces.indexOf(anchor)
+              if (anchorIndex !== -1) {
+                console.log(`[PDF]       Found anchor: "${anchor}" at position ${anchorIndex}`)
+                anchorFound = true
+
+                // Get Y range from positions near this anchor
+                const anchorEnd = anchorIndex + anchor.length
+                const anchorPositions = textPositions.filter(pos => {
+                  const posStart = pos.startIndexWithSpaces
+                  const posEnd = posStart + normalizeWithSpaces(pos.text).length
+                  return posStart < anchorEnd + 50 && posEnd > anchorIndex - 50
+                })
+
+                if (anchorPositions.length > 0) {
+                  const minY = Math.min(...anchorPositions.map(p => p.transform[5]))
+                  const maxY = Math.max(...anchorPositions.map(p => p.transform[5]))
+                  const yTolerance = 100
+
+                  // Try matching full block text in this Y area
+                  for (const pos of textPositions) {
+                    const posY = pos.transform[5]
+                    if (posY < minY - yTolerance || posY > maxY + yTolerance) continue
+
+                    const posNormalized = normalizeWithSpaces(pos.text)
+
+                    // Check if this text is part of the block
+                    if (posNormalized.length >= 5 && normalizedBlock.includes(posNormalized)) {
+                      anchorRects.push(createRectFromPosition(pos, pageNum))
+                    }
+                  }
+                }
+
+                // If we found matches, stop searching other anchors
+                if (anchorRects.length > 0) {
+                  break
+                }
+              }
+            }
+
+            if (anchorRects.length > 0) {
+              console.log(`[PDF]       ✓ Anchor: +${anchorRects.length} rects`)
+              blockRects.push(...anchorRects)
+              if (matchMethod === '') matchMethod = 'anchor'
+              else matchMethod += '+anchor'
+            }
+          }
+
+          // PASS 2.5: Fuzzy fragment matching (ACCUMULATE)
+          const fragmentRects: typeof blockRects = []
+          {
+            const normalizedBlock = normalizeWithSpaces(block)
+            const blockWords = normalizedBlock.split(' ').filter(w => w.length >= 6)
+
+            for (const pos of textPositions) {
+              const posNormalized = normalizeWithSpaces(pos.text)
+
+              if (posNormalized.length < 3) continue
+
+              let isMatch = false
+
+              // Check 1: Position text is substring of block
+              if (posNormalized.length >= 5 && normalizedBlock.includes(posNormalized))
+                isMatch = true
+
+              // Check 2: Position text has high similarity with block
+              if (!isMatch && posNormalized.length >= 15) {
+                const similarity = calculateSimilarity(posNormalized, normalizedBlock)
+                if (similarity >= 0.80)
+                  isMatch = true
+              }
+
+              // Check 3: Position contains 2+ words from block
+              if (!isMatch && blockWords.length >= 2) {
+                const matchingWords = blockWords.filter(word => posNormalized.includes(word))
+                if (matchingWords.length >= 2)
+                  isMatch = true
+              }
+
+              if (isMatch) {
+                fragmentRects.push(createRectFromPosition(pos, pageNum))
+              }
+            }
+
+            if (fragmentRects.length > 0) {
+              console.log(`[PDF]       ✓ Fragment: +${fragmentRects.length} rects`)
+              blockRects.push(...fragmentRects)
+              if (matchMethod === '') matchMethod = 'fragment'
+              else matchMethod += '+fragment'
+            }
+          }
+
+          // PASS 3: Token matching (ACCUMULATE)
+          const tokenRects: typeof blockRects = []
+          {
             const matchedIndices = findSequentialMatches(blockTokens, pdfTokens, calculateSimilarity)
 
             if (matchedIndices.length > 0) {
-              totalMatched += matchedIndices.length
-              blockRects = generateMatchedRects(matchedIndices, pdfTokens, pageNum)
+              tokenRects.push(...generateMatchedRects(matchedIndices, pdfTokens, pageNum))
 
-              // PASS 2.5: Sentence refinement - if token match is poor, try full sentences at that location
+              // PASS 3.5: Sentence refinement - if token match is poor, try full sentences at that location
               if (matchedIndices.length < blockTokens.length * 0.8) {
-                console.log(`[PDF]       Token match was ${(matchedIndices.length / blockTokens.length * 100).toFixed(0)}%, trying sentence refinement...`)
+                const refinementRects: typeof blockRects = []
 
                 // Get Y range from matched tokens
                 const minMatchY = Math.min(...matchedIndices.map(idx => pdfTokens[idx].y))
@@ -810,7 +948,6 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
                 const yTolerance = 50
 
                 // Try sentence matching in this Y range
-                const sentenceRects: typeof blockRects = []
                 const normalizedBlock = normalizeWithSpaces(block)
 
                 for (const pos of textPositions) {
@@ -821,26 +958,32 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
                   // Check if this text matches the block
                   if (posNormalized.length >= 5 && normalizedBlock.includes(posNormalized)) {
-                    sentenceRects.push(createRectFromPosition(pos, pageNum))
+                    refinementRects.push(createRectFromPosition(pos, pageNum))
                   }
                 }
 
-                if (sentenceRects.length > blockRects.length) {
-                  console.log(`[PDF]       ✓ Sentence refinement: ${sentenceRects.length} rects (vs ${blockRects.length} from tokens)`)
-                  blockRects = sentenceRects
-                  matchMethod = 'token+sentence'
-                  totalMatched = blockTokens.length
+                if (refinementRects.length > 0) {
+                  console.log(`[PDF]       ✓ Refinement: +${refinementRects.length} rects (upgrading ${matchedIndices.length} token matches)`)
+                  tokenRects.push(...refinementRects)
                 }
               }
             }
+
+            if (tokenRects.length > 0) {
+              console.log(`[PDF]       ✓ Token: +${tokenRects.length} rects`)
+              blockRects.push(...tokenRects)
+              if (matchMethod === '') matchMethod = 'token'
+              else matchMethod += '+token'
+            }
           }
-          else {
-            // Sentence matching succeeded, count as all tokens matched
+
+          // Count total matched for statistics
+          if (blockRects.length > 0) {
             totalMatched += blockTokens.length
           }
 
           if (blockRects.length > 0) {
-            // PASS 3: Per-block gap filling if many rects matched (indicates continuous text)
+            // PASS 4: Per-block gap filling if many rects matched (indicates continuous text)
             if (blockRects.length >= 10) {
               const blockMinY = Math.min(...blockRects.map(r => r.y1))
               const blockMaxY = Math.max(...blockRects.map(r => r.y2))
@@ -874,6 +1017,19 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
             }
 
             console.log(`[PDF]   ✓ Block ${i + 1}: ${matchMethod} → ${blockRects.length} rects (${block.substring(0, 30)}...)`)
+
+            // Store matched block metadata
+            matchedBlocks.push({
+              blockIndex: i,
+              blockText: block,
+              rects: blockRects,
+              method: matchMethod,
+              yRange: {
+                min: Math.min(...blockRects.map(r => r.y1)),
+                max: Math.max(...blockRects.map(r => r.y2)),
+              },
+            })
+
             allMatchedRects.push(...blockRects)
           }
           else {
@@ -886,9 +1042,207 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
           return
         }
 
-        console.log(`[PDF] ✅ Total: ${totalMatched}/${totalTokens} tokens (${(totalMatched / totalTokens * 100).toFixed(0)}%)`)
+        console.log(`[PDF] ✅ Phase 1 complete: ${totalMatched}/${totalTokens} tokens (${(totalMatched / totalTokens * 100).toFixed(0)}%)`)
 
-        // // PASS 4: Fill gaps between min/max Y of existing matches
+        // ========== PHASE 1.5: RECONSTRUCT PDF BLOCKS BY LOCATION ==========
+        console.log(`[PDF] 🧩 Phase 1.5: Reconstructing PDF blocks from ${matchedBlocks.length} matched areas...`)
+
+        // Group rects by Y proximity to reconstruct actual PDF blocks
+        interface ReconstructedBlock {
+          sourceBlockIndices: number[]
+          yRange: { min: number; max: number }
+          rects: typeof allMatchedRects
+          pdfText: string
+        }
+
+        const reconstructedBlocks: ReconstructedBlock[] = []
+
+        // Sort all matched blocks by Y position
+        const sortedBlocks = [...matchedBlocks].sort((a, b) => a.yRange.min - b.yRange.min)
+
+        for (const mb of sortedBlocks) {
+          // Try to find existing reconstructed block that overlaps
+          const overlappingBlock = reconstructedBlocks.find(rb => {
+            const gap = Math.max(mb.yRange.min - rb.yRange.max, rb.yRange.min - mb.yRange.max)
+            return gap < 30 // Within 30px = same PDF block
+          })
+
+          if (overlappingBlock) {
+            // Merge into existing reconstructed block
+            overlappingBlock.sourceBlockIndices.push(mb.blockIndex)
+            overlappingBlock.rects.push(...mb.rects)
+            overlappingBlock.yRange.min = Math.min(overlappingBlock.yRange.min, mb.yRange.min)
+            overlappingBlock.yRange.max = Math.max(overlappingBlock.yRange.max, mb.yRange.max)
+          }
+          else {
+            // Create new reconstructed block
+            reconstructedBlocks.push({
+              sourceBlockIndices: [mb.blockIndex],
+              yRange: { ...mb.yRange },
+              rects: [...mb.rects],
+              pdfText: '',
+            })
+          }
+        }
+
+        // Extract PDF text for each reconstructed block with proper formatting
+        for (const rb of reconstructedBlocks) {
+          const textsInRange = textPositions
+            .filter(pos => {
+              const y = pos.transform[5]
+              return y >= rb.yRange.min - 10 && y <= rb.yRange.max + 10
+            })
+            .sort((a, b) => {
+              const yDiff = a.transform[5] - b.transform[5]
+              if (Math.abs(yDiff) < 5) return a.transform[4] - b.transform[4] // Same line, sort by X
+              return yDiff
+            })
+
+          // Build text with line breaks and merge split words
+          let formattedText = ''
+          let lastY = -1
+          let currentLine = ''
+
+          for (const pos of textsInRange) {
+            const y = pos.transform[5]
+            const text = pos.text.trim()
+            if (!text) continue
+
+            // New line if Y changed significantly (>5px)
+            if (lastY >= 0 && Math.abs(y - lastY) > 5) {
+              formattedText += currentLine.trim() + '\n'
+              currentLine = text
+            }
+            else {
+              // Same line - add with space
+              if (currentLine.length > 0) {
+                currentLine += ' ' + text
+              }
+              else {
+                currentLine = text
+              }
+            }
+
+            lastY = y
+          }
+
+          // Add final line
+          if (currentLine.length > 0) {
+            formattedText += currentLine.trim()
+          }
+
+          // Post-process: merge split words (e.g., "o wner" → "owner", "K eys" → "Keys")
+          // Pattern: single letter followed by space and lowercase word
+          formattedText = formattedText.replace(/\b([a-zA-Z])\s+([a-z]+)/g, '$1$2')
+
+          // Clean up excessive spaces
+          formattedText = formattedText.replace(/ {2,}/g, ' ')
+
+          rb.pdfText = formattedText
+        }
+
+        console.log(`[PDF] 🧩 Reconstructed ${reconstructedBlocks.length} PDF blocks from ${matchedBlocks.length} source blocks`)
+        for (let i = 0; i < reconstructedBlocks.length; i++) {
+          const rb = reconstructedBlocks[i]
+          console.log(`[PDF]   PDF Block ${i + 1}: Y ${rb.yRange.min.toFixed(0)}-${rb.yRange.max.toFixed(0)}, combines source blocks [${rb.sourceBlockIndices.map(idx => idx + 1).join(', ')}], ${rb.rects.length} rects`)
+          console.log(`[PDF]       Reconstructed paragraph (${rb.pdfText.length} chars):`)
+          console.log(`[PDF]       "${rb.pdfText}"`)
+
+          // Show which source blocks this corresponds to
+          const sourceBlocks = rb.sourceBlockIndices.map(idx => uniqueBlocks[idx])
+          console.log(`[PDF]       Source blocks:`)
+          for (let j = 0; j < sourceBlocks.length; j++) {
+            const srcIdx = rb.sourceBlockIndices[j]
+            console.log(`[PDF]         [${srcIdx + 1}] ${sourceBlocks[j].substring(0, 60)}...`)
+          }
+        }
+
+        // ========== PHASE 2: QUALITY ANALYSIS & FILTERING (COMMENTED OUT FOR TESTING) ==========
+        // console.log(`[PDF] 🔍 Phase 2: Validating and filtering ${matchedBlocks.length} matched blocks...`)
+
+        // // Filter rects per block: Keep only rects that contain block keywords
+        // const filteredBlocks: MatchedBlock[] = []
+
+        // for (const mb of matchedBlocks) {
+        //   // Extract key words from block (filter common words)
+        //   const blockWords = normalizeWithSpaces(mb.blockText)
+        //     .split(' ')
+        //     .filter(w => w.length >= 5 && !['where', 'there', 'these', 'those', 'their', 'which', 'would', 'could', 'should'].includes(w))
+
+        //   if (blockWords.length === 0) {
+        //     console.log(`[PDF]   ⚠️  Block ${mb.blockIndex + 1}: No keywords to validate, keeping all rects`)
+        //     filteredBlocks.push(mb)
+        //     continue
+        //   }
+
+        //   // Check each rect: does it contain any block keywords?
+        //   const validRects = mb.rects.filter(rect => {
+        //     // Find text items that overlap with this rect
+        //     const overlappingTexts = textPositions.filter(pos => {
+        //       const posY = pos.transform[5]
+        //       const posX = pos.transform[4]
+        //       return Math.abs(posY - rect.y1) < 10 && posX >= rect.x1 - 5 && posX <= rect.x2 + 5
+        //     })
+
+        //     // Check if any overlapping text contains block keywords
+        //     for (const pos of overlappingTexts) {
+        //       const posNormalized = normalizeWithSpaces(pos.text)
+        //       const hasKeyword = blockWords.some(kw => posNormalized.includes(kw))
+        //       if (hasKeyword) return true
+        //     }
+
+        //     return false
+        //   })
+
+        //   const removedCount = mb.rects.length - validRects.length
+        //   if (removedCount > 0) {
+        //     console.log(`[PDF]   🧹 Block ${mb.blockIndex + 1}: Removed ${removedCount} irrelevant rects (${validRects.length} kept)`)
+        //   }
+
+        //   if (validRects.length > 0) {
+        //     filteredBlocks.push({
+        //       ...mb,
+        //       rects: validRects,
+        //       yRange: {
+        //         min: Math.min(...validRects.map(r => r.y1)),
+        //         max: Math.max(...validRects.map(r => r.y2)),
+        //       },
+        //     })
+        //   }
+        //   else {
+        //     console.log(`[PDF]   ❌ Block ${mb.blockIndex + 1}: All rects removed (no keywords matched)`)
+        //   }
+        // }
+
+        // console.log(`[PDF] ✅ Phase 2 complete: ${filteredBlocks.length}/${matchedBlocks.length} blocks kept after filtering`)
+
+        // // Update allMatchedRects with filtered results
+        // allMatchedRects.length = 0
+        // for (const fb of filteredBlocks) {
+        //   allMatchedRects.push(...fb.rects)
+        // }
+
+        // // Check for overlapping Y ranges (diagnostic info)
+        // for (let i = 0; i < filteredBlocks.length; i++) {
+        //   for (let j = i + 1; j < filteredBlocks.length; j++) {
+        //     const blockA = filteredBlocks[i]
+        //     const blockB = filteredBlocks[j]
+
+        //     const overlapY = Math.max(0,
+        //       Math.min(blockA.yRange.max, blockB.yRange.max) -
+        //       Math.max(blockA.yRange.min, blockB.yRange.min)
+        //     )
+        //     const rangeA = blockA.yRange.max - blockA.yRange.min
+        //     const rangeB = blockB.yRange.max - blockB.yRange.min
+        //     const overlapPercent = overlapY / Math.min(rangeA, rangeB)
+
+        //     if (overlapPercent > 0.5) {
+        //       console.log(`[PDF]   ℹ️  Blocks ${blockA.blockIndex + 1} & ${blockB.blockIndex + 1} overlap ${(overlapPercent * 100).toFixed(0)}% in Y range`)
+        //     }
+        //   }
+        // }
+
+        // // PASS 6: Global gap filling (commented out - using per-block instead)
         // const minY = Math.min(...allMatchedRects.map(r => r.y1))
         // const maxY = Math.max(...allMatchedRects.map(r => r.y2))
         // let gapsFilled = 0
@@ -951,7 +1305,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     }
 
     findHighlights()
-  }, [isFullyReady, chunkContext, pdfDocument, calculateSimilarity, normalizeWithSpaces, normalizeNoSpaces, buildFullTextMap, createRectFromPosition])
+  }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, calculateSimilarity, normalizeWithSpaces, normalizeNoSpaces, buildFullTextMap, createRectFromPosition])
 
   // Memoize callbacks to prevent PdfHighlighter re-renders
   const enableAreaSelection = useCallback(() => false, [])
