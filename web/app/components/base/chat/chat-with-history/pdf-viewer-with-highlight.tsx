@@ -186,6 +186,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         console.log(`[PDF] 📝 ${chunkBlocks.length} chunk blocks to match`)
 
         const allMatchedRects: Array<{ x1: number; y1: number; x2: number; y2: number; width: number; height: number; pageNumber: number }> = []
+        const matchResults: Array<{ blockIndex: number; score: number; matched: boolean }> = []
 
         // Match each chunk block using sliding window approach
         for (let i = 0; i < chunkBlocks.length; i++) {
@@ -237,18 +238,43 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
                 pageNumber: pageNum,
               })
             }
+
+            matchResults.push({ blockIndex: i, score: bestMatch.score, matched: true })
           }
           else {
             console.log(`[PDF]       ✗ No match found (best score: ${bestMatch?.score.toFixed(2) || '0.00'})`)
+            matchResults.push({ blockIndex: i, score: bestMatch?.score || 0, matched: false })
           }
         }
+
+        // Calculate quality metrics
+        const totalBlocks = chunkBlocks.length
+        const matchedBlocks = matchResults.filter(r => r.matched).length
+        const matchRate = totalBlocks > 0 ? matchedBlocks / totalBlocks : 0
+        const avgScore = matchResults.length > 0
+          ? matchResults.reduce((sum, r) => sum + r.score, 0) / matchResults.length
+          : 0
+
+        // Calculate character coverage
+        const matchedBlocksText = chunkBlocks
+          .filter((_, idx) => matchResults[idx]?.matched)
+          .join(' ')
+        const coverageRate = chunkContext.length > 0
+          ? matchedBlocksText.length / chunkContext.length
+          : 0
+
+        console.log('\n[PDF] 📊 QUALITY METRICS')
+        console.log(`[PDF] ${'='.repeat(50)}`)
+        console.log(`[PDF] Block Match Rate:  ${matchedBlocks}/${totalBlocks} (${(matchRate * 100).toFixed(1)}%)`)
+        console.log(`[PDF] Average Score:     ${avgScore.toFixed(3)}`)
+        console.log(`[PDF] Coverage:          ${(coverageRate * 100).toFixed(1)}% of chunk chars`)
+        console.log(`[PDF] Matched Rects:     ${allMatchedRects.length}`)
+        console.log(`[PDF] ${'='.repeat(50)}\n`)
 
         if (allMatchedRects.length === 0) {
           console.log('[PDF] ⚠️ No matches found')
           return
         }
-
-        console.log(`[PDF] ✅ Matched ${allMatchedRects.length} rects`)
 
         // Create highlight
         const boundingRect = {
