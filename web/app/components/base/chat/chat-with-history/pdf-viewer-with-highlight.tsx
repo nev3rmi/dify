@@ -1,5 +1,5 @@
 import type { FC } from 'react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import 'react-pdf-highlighter/dist/style.css'
 import { Highlight, PdfHighlighter, PdfLoader } from 'react-pdf-highlighter'
 import type { IHighlight, ScaledPosition } from 'react-pdf-highlighter'
@@ -20,515 +20,6 @@ type PdfViewerWithHighlightProps = {
 }
 
 const CHUNK_API_URL = 'https://n8n.toho.vn/webhook/dbf0d2ae-ec68-4827-bdb7-f5dec29c2b1d'
-
-// ============ Token-based matching types and functions ============
-interface PDFToken {
-  text: string
-  raw: string  // original text, no changes
-  lowercase: string  // lowercase with punctuation
-  normalized: string  // lowercase without punctuation
-  x: number
-  y: number
-  width: number
-  height: number
-  itemIndex: number
-}
-
-function normalizeToken(text: string): string {
-  return text.toLowerCase().replace(/[^\w]/g, '').trim()
-}
-
-interface ChunkToken {
-  raw: string  // original text, no changes
-  lowercase: string  // lowercase with punctuation
-  normalized: string  // lowercase without punctuation
-}
-
-function tokenizeChunk(text: string): ChunkToken[] {
-  return text.split(/\s+/)
-    .filter(w => w.length > 0)
-    .map(w => ({
-      raw: w.trim(),
-      lowercase: w.toLowerCase().trim(),
-      normalized: normalizeToken(w),
-    }))
-    .filter(t => t.raw.length > 0)  // Keep all tokens that have raw content
-}
-
-function tokenizePDF(items: any[]): PDFToken[] {
-  const tokens: PDFToken[] = []
-  items.forEach((item, idx) => {
-    if (!item.str) return
-    const words = item.str.split(/\s+/).filter((w: string) => w.length > 0)
-    const charWidth = item.str.length > 0 ? item.width / item.str.length : 0
-    let currentX = item.transform[4]
-
-    words.forEach((word: string) => {
-      const raw = word.trim()
-      if (raw.length === 0) return  // Filter by raw, not normalized
-      tokens.push({
-        text: word,
-        raw,
-        lowercase: word.toLowerCase().trim(),
-        normalized: normalizeToken(word),  // Keep even if empty
-        x: currentX,
-        y: item.transform[5],
-        width: word.length * charWidth,
-        height: item.height || Math.abs(item.transform[3]),
-        itemIndex: idx,
-      })
-      currentX += (word.length + 1) * charWidth
-    })
-  })
-  return tokens
-}
-
-function tokensMatch(a: string, b: string, similarityFn: (s1: string, s2: string) => number): boolean {
-  if (a === b) return true
-  if (a.length >= 3 && b.length >= 3) {
-    if (a.includes(b) || b.includes(a)) return true
-    if (a.length >= 4 && b.length >= 4) {
-      return similarityFn(a, b) >= 0.8
-    }
-  }
-  return false
-}
-
-// Try to match a chunk token against one or more consecutive PDF tokens (handles split words)
-function tryMatchWithMerge(
-  chunkToken: string,
-  pdfTokens: PDFToken[],
-  startIdx: number,
-  field: TokenField,
-  similarityFn: (s1: string, s2: string) => number,
-): { matched: boolean; consumedCount: number } {
-  // Try single token match first
-  if (startIdx < pdfTokens.length && tokensMatch(chunkToken, pdfTokens[startIdx][field], similarityFn)) {
-    return { matched: true, consumedCount: 1 }
-  }
-
-  // Try merging 2-3 consecutive PDF tokens
-  for (let mergeCount = 2; mergeCount <= 3 && startIdx + mergeCount <= pdfTokens.length; mergeCount++) {
-    const merged = pdfTokens.slice(startIdx, startIdx + mergeCount).map(t => t[field]).join('')
-    if (tokensMatch(chunkToken, merged, similarityFn)) {
-      return { matched: true, consumedCount: mergeCount }
-    }
-  }
-
-  return { matched: false, consumedCount: 0 }
-}
-
-// Proximity matching for short blocks (titles/headings) - finds tokens on same line regardless of order
-function findProximityMatches(
-  chunkTokens: string[],
-  pdfTokens: PDFToken[],
-  similarityFn: (s1: string, s2: string) => number,
-): number[] {
-  if (chunkTokens.length === 0 || pdfTokens.length === 0) return []
-
-  // Find first token to get anchor Y position
-  let anchorY = -1
-  let anchorIdx = -1
-  for (let i = 0; i < pdfTokens.length; i++) {
-    if (tokensMatch(chunkTokens[0], pdfTokens[i].normalized, similarityFn)) {
-      anchorY = pdfTokens[i].y
-      anchorIdx = i
-      break
-    }
-  }
-
-  if (anchorIdx === -1) return []
-
-  // Find all matching tokens within Y-range of anchor (same line ± tolerance)
-  const yTolerance = 20
-  const matched: number[] = []
-  const usedChunkTokens = new Set<number>()
-
-  for (let i = 0; i < pdfTokens.length; i++) {
-    if (Math.abs(pdfTokens[i].y - anchorY) > yTolerance) continue
-
-    // Find best matching chunk token
-    for (let j = 0; j < chunkTokens.length; j++) {
-      if (usedChunkTokens.has(j)) continue
-      if (tokensMatch(chunkTokens[j], pdfTokens[i].normalized, similarityFn)) {
-        matched.push(i)
-        usedChunkTokens.add(j)
-        break
-      }
-    }
-  }
-
-  return matched
-}
-
-// Helper: Count gaps in matched token indices
-function countGaps(indices: number[]): number {
-  if (indices.length <= 1) return 0
-  let gaps = 0
-  for (let i = 1; i < indices.length; i++) {
-    if (indices[i] !== indices[i - 1] + 1)
-      gaps++
-  }
-  return gaps
-}
-
-// Helper: Find continuous spans in matched indices
-function findContinuousSpans(indices: number[]): number[][] {
-  if (indices.length === 0) return []
-  const spans: number[][] = []
-  let currentSpan: number[] = [indices[0]]
-
-  for (let i = 1; i < indices.length; i++) {
-    if (indices[i] === indices[i - 1] + 1) {
-      currentSpan.push(indices[i])
-    }
-    else {
-      spans.push(currentSpan)
-      currentSpan = [indices[i]]
-    }
-  }
-  spans.push(currentSpan)
-  return spans
-}
-
-// Helper: Calculate match quality score
-function calculateMatchScore(matchedIndices: number[], totalTokens: number): number {
-  if (matchedIndices.length === 0) return 0
-
-  // Base score: match percentage
-  const baseScore = (matchedIndices.length / totalTokens) * 100
-
-  // Penalty for gaps (discontinuity)
-  const gaps = countGaps(matchedIndices)
-  const gapPenalty = gaps * 5
-
-  // Bonus for continuous spans
-  const spans = findContinuousSpans(matchedIndices)
-  let continuousBonus = 0
-  const longestSpan = Math.max(...spans.map(s => s.length))
-
-  for (const span of spans) {
-    if (span.length >= 10) continuousBonus += 10
-    if (span.length >= 20) continuousBonus += 10
-  }
-
-  // Extra bonus if longest span is >50% of total
-  if (longestSpan >= totalTokens * 0.5) continuousBonus += 20
-
-  return baseScore - gapPenalty + continuousBonus
-}
-
-// Core matching logic - tries to match tokens from a given field
-type TokenField = 'raw' | 'lowercase' | 'normalized'
-
-function doSequentialMatch(
-  chunkTokenValues: string[],
-  pdfTokens: PDFToken[],
-  pdfField: TokenField,
-  similarityFn: (s1: string, s2: string) => number,
-): { indices: number[]; score: number } {
-  const startCandidates: number[] = []
-  for (let i = 0; i < pdfTokens.length; i++) {
-    // Also check if merging first few tokens matches
-    const result = tryMatchWithMerge(chunkTokenValues[0], pdfTokens, i, pdfField, similarityFn)
-    if (result.matched) startCandidates.push(i)
-  }
-
-  if (startCandidates.length === 0) return { indices: [], score: 0 }
-
-  let bestMatch = { indices: [] as number[], score: 0 }
-
-  for (const startIdx of startCandidates) {
-    const matched: number[] = []
-    let pdfIdx = startIdx
-    let chunkIdx = 0
-    let pdfGaps = 0
-    let chunkSkips = 0
-    const maxPdfGap = 20
-    const maxChunkSkip = 20
-
-    while (chunkIdx < chunkTokenValues.length && pdfIdx < pdfTokens.length) {
-      // Try to match with potential merge of split words
-      const result = tryMatchWithMerge(chunkTokenValues[chunkIdx], pdfTokens, pdfIdx, pdfField, similarityFn)
-
-      if (result.matched) {
-        // Add all consumed PDF token indices
-        for (let k = 0; k < result.consumedCount; k++) {
-          matched.push(pdfIdx + k)
-        }
-        pdfIdx += result.consumedCount
-        chunkIdx++
-        pdfGaps = 0
-        chunkSkips = 0
-      }
-      else {
-        pdfGaps++
-        if (pdfGaps <= maxPdfGap) {
-          pdfIdx++
-        }
-        else {
-          pdfGaps = 0
-          chunkSkips++
-          if (chunkSkips > maxChunkSkip) break
-          chunkIdx++
-        }
-      }
-    }
-
-    const score = calculateMatchScore(matched, chunkTokenValues.length)
-    if (score > bestMatch.score) {
-      bestMatch = { indices: matched, score }
-    }
-  }
-
-  return bestMatch
-}
-
-function findSequentialMatches(
-  chunkTokens: ChunkToken[],
-  pdfTokens: PDFToken[],
-  similarityFn: (s1: string, s2: string) => number,
-): number[] {
-  if (chunkTokens.length === 0 || pdfTokens.length === 0) return []
-
-  // For short blocks (titles), use proximity matching instead of sequential
-  if (chunkTokens.length <= 15) {
-    const proximityResult = findProximityMatches(chunkTokens.map(t => t.normalized), pdfTokens, similarityFn)
-    if (proximityResult.length >= chunkTokens.length * 0.6) {
-      console.log(`[PDF]       Using proximity matching (short block): ${proximityResult.length}/${chunkTokens.length} tokens`)
-      return proximityResult
-    }
-  }
-
-  const threshold = 0.4  // 40% match rate to accept
-
-  // Try all 3 passes and pick the best
-  const passes = [
-    { name: 'raw', values: chunkTokens.map(t => t.raw), field: 'raw' as TokenField },
-    { name: 'lowercase', values: chunkTokens.map(t => t.lowercase), field: 'lowercase' as TokenField },
-    { name: 'normalized', values: chunkTokens.map(t => t.normalized), field: 'normalized' as TokenField },
-  ]
-
-  let best = { name: '', result: { indices: [] as number[], score: 0 } }
-
-  for (const pass of passes) {
-    const result = doSequentialMatch(pass.values, pdfTokens, pass.field, similarityFn)
-    const rate = result.indices.length / chunkTokens.length
-
-    if (rate >= threshold) {
-      // Good enough match, use it
-      console.log(`[PDF]       ✓ ${pass.name}: ${result.indices.length}/${chunkTokens.length} (${(rate * 100).toFixed(0)}%)`)
-      return result.indices
-    }
-
-    if (result.score > best.result.score) {
-      best = { name: pass.name, result }
-    }
-  }
-
-  // No pass reached threshold, use best
-  const rate = best.result.indices.length / chunkTokens.length
-  console.log(`[PDF]       Best: ${best.name} ${best.result.indices.length}/${chunkTokens.length} (${(rate * 100).toFixed(0)}%)`)
-  return best.result.indices
-}
-
-function generateMatchedRects(
-  matchedIndices: number[],
-  pdfTokens: PDFToken[],
-  pageNumber: number,
-): Array<{ x1: number; y1: number; x2: number; y2: number; width: number; height: number; pageNumber: number }> {
-  const rects: Array<{ x1: number; y1: number; x2: number; y2: number; width: number; height: number; pageNumber: number }> = []
-
-  for (const idx of matchedIndices) {
-    const token = pdfTokens[idx]
-    const yOffset = token.height * 0.15
-    rects.push({
-      x1: token.x,
-      y1: token.y - yOffset,
-      x2: token.x + token.width,
-      y2: token.y + token.height - yOffset,
-      width: token.width,
-      height: token.height,
-      pageNumber,
-    })
-  }
-
-  if (rects.length === 0) return []
-
-  const sorted = [...rects].sort((a, b) => {
-    const yDiff = a.y1 - b.y1
-    if (Math.abs(yDiff) < 5) return a.x1 - b.x1
-    return yDiff
-  })
-
-  const lines: Array<typeof rects> = []
-  let currentLine: typeof rects = [sorted[0]]
-
-  for (let i = 1; i < sorted.length; i++) {
-    const sameLine = Math.abs(sorted[i].y1 - currentLine[0].y1) < 5
-    if (sameLine) {
-      currentLine.push(sorted[i])
-    }
-    else {
-      lines.push(currentLine)
-      currentLine = [sorted[i]]
-    }
-  }
-  lines.push(currentLine)
-
-  const merged: typeof rects = []
-  for (const line of lines) {
-    const minX = Math.min(...line.map(r => r.x1))
-    const maxX = Math.max(...line.map(r => r.x2))
-    const avgY1 = line.reduce((sum, r) => sum + r.y1, 0) / line.length
-    const avgY2 = line.reduce((sum, r) => sum + r.y2, 0) / line.length
-    const avgHeight = line.reduce((sum, r) => sum + r.height, 0) / line.length
-
-    merged.push({
-      x1: minX,
-      y1: avgY1,
-      x2: maxX,
-      y2: avgY2,
-      width: maxX - minX,
-      height: avgHeight,
-      pageNumber,
-    })
-    console.log(`[PDF]     Line: ${line.length} tokens merged → rect from x:${minX.toFixed(1)} to x:${maxX.toFixed(1)} (width: ${(maxX - minX).toFixed(1)})`)
-  }
-
-  return merged
-}
-
-const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
-  url,
-  chunkId,
-  onFullTextExtracted,
-}) => {
-  const [pdfLoaded, setPdfLoaded] = useState(false)
-  const [apiLoaded, setApiLoaded] = useState(false)
-  const [fullChunkContext, setFullChunkContext] = useState<string | null>(null)
-  const [apiPageNumber, setApiPageNumber] = useState<number | null>(null)
-  const hasFetchedRef = useRef<string | null>(null)
-  const onFullTextExtractedRef = useRef(onFullTextExtracted)
-  const containerRef = useRef<HTMLDivElement>(null)
-
-  // Keep callback ref updated
-  useEffect(() => {
-    onFullTextExtractedRef.current = onFullTextExtracted
-  }, [onFullTextExtracted])
-
-  // Reset PDF loaded state when URL changes
-  useEffect(() => {
-    setPdfLoaded(false)
-  }, [url])
-
-  // Check if everything is ready
-  const isReady = pdfLoaded && (apiLoaded || !chunkId)
-
-  // Fetch full content from API - only once per chunkId
-  useEffect(() => {
-    if (!chunkId) {
-      setApiLoaded(true)
-      return
-    }
-
-    // Skip if already fetched for this chunkId
-    if (hasFetchedRef.current === chunkId) return
-    hasFetchedRef.current = chunkId
-
-    setApiLoaded(false)
-    setFullChunkContext(null)
-    setApiPageNumber(null)
-    const fetchChunkContext = async () => {
-      console.log(`[PDF] Fetching chunk ${chunkId}...`)
-      try {
-        const response = await fetch(`${CHUNK_API_URL}?chunkID=${chunkId}`)
-        const text = await response.text()
-        console.log(`[PDF] Response: ${text.substring(0, 200)}`)
-
-        if (text) {
-          const data = JSON.parse(text)
-          console.log(`[PDF] API data:`, data)
-
-          if (data.chunk_context) {
-            // Handle double-encoded JSON string
-            let chunkText = data.chunk_context
-            if (typeof chunkText === 'string' && chunkText.startsWith('"') && chunkText.endsWith('"')) {
-              chunkText = JSON.parse(chunkText) // Parse the inner JSON string
-            }
-            setFullChunkContext(chunkText)
-            console.log(`[PDF] Got context: ${chunkText.length} chars`)
-            if (onFullTextExtractedRef.current)
-              onFullTextExtractedRef.current(chunkText)
-          }
-          if (data.page_numbers && data.page_numbers.length > 0) {
-            setApiPageNumber(data.page_numbers[0])
-            console.log(`[PDF] API page number: ${data.page_numbers[0]}`)
-          }
-        }
-      }
-      catch (error: any) {
-        console.log(`[PDF] Error: ${error.message}`)
-      }
-      finally {
-        setApiLoaded(true)
-      }
-    }
-
-    fetchChunkContext()
-  }, [chunkId])
-
-  // Handle PDF document ready - delayed to ensure viewer is initialized
-  const handlePdfReady = useCallback(() => {
-    setTimeout(() => {
-      console.log('[PDF] PDF viewer ready')
-      setPdfLoaded(true)
-    }, 500)
-  }, [])
-
-  return (
-    <div
-      ref={containerRef}
-      className='relative h-full w-full overflow-hidden'
-      style={{ contain: 'layout' }}
-    >
-      {/* Loading overlay */}
-      {!isReady && (
-        <div className='absolute inset-0 z-50 flex flex-col items-center justify-center bg-white'>
-          <Loading type='app' />
-          <div className='mt-4 text-sm text-gray-500'>
-            {!pdfLoaded && !apiLoaded && 'Loading PDF and source text...'}
-            {!pdfLoaded && apiLoaded && 'Loading PDF...'}
-            {pdfLoaded && !apiLoaded && 'Loading source text...'}
-          </div>
-        </div>
-      )}
-
-      {/* PDF Viewer */}
-      <div
-        className='h-full w-full overflow-x-hidden overflow-y-auto'
-      >
-        <PdfLoader
-          key={url}
-          workerSrc='/pdf.worker.min.mjs'
-          url={url}
-          beforeLoad={<div />}
-        >
-          {pdfDocument => (
-            <PdfHighlighterStable
-              pdfDocument={pdfDocument}
-              onReady={handlePdfReady}
-              containerWidth={containerRef.current?.clientWidth || 600}
-              chunkContext={fullChunkContext}
-              isFullyReady={isReady}
-              apiPageNumber={apiPageNumber}
-            />
-          )}
-        </PdfLoader>
-      </div>
-    </div>
-  )
-}
 
 // PDF renderer component
 type PdfHighlighterStableProps = {
@@ -551,7 +42,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
   const [viewerReady, setViewerReady] = useState(false)
 
   // Page text map with line boxes
-  interface LineGroup {
+  type LineGroup = {
     y: number
     text: string
     box: { x1: number; y1: number; x2: number; y2: number }
@@ -625,7 +116,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         hasCalculatedScaleRef.current = true
         console.log(`[PDF] ✅ Scale calculated ONCE: ${roundedScale} (container: ${containerWidth}px, page: ${viewport.width}px)`)
       }
-      catch (e) {
+      catch {
         console.log('[PDF] Scale calculation failed, using default')
         setScale('1.0')
         hasCalculatedScaleRef.current = true
@@ -647,64 +138,8 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     }
   }, [onReady, scale])
 
-  // Normalization helpers for sentence matching
+  // Normalization helper for fuzzy line matching
   const normalizeWithSpaces = useCallback((text: string) => text.toLowerCase().replace(/\s+/g, ' ').trim(), [])
-  const normalizeNoSpaces = useCallback((text: string) => text.toLowerCase().replace(/\s+/g, '').trim(), [])
-
-  // Build full text map with position tracking
-  interface TextPosition {
-    text: string
-    transform: number[]
-    width: number
-    height: number
-    startIndexWithSpaces: number
-    startIndexNoSpaces: number
-  }
-
-  const buildFullTextMap = useCallback((items: any[]) => {
-    let fullTextWithSpaces = ''
-    let fullTextNoSpaces = ''
-    const textPositions: TextPosition[] = []
-
-    items.forEach((item: any) => {
-      if (!item.str) return
-
-      textPositions.push({
-        text: item.str,
-        transform: item.transform,
-        width: item.width,
-        height: item.height || Math.abs(item.transform[3]),
-        startIndexWithSpaces: fullTextWithSpaces.length,
-        startIndexNoSpaces: fullTextNoSpaces.length,
-      })
-
-      fullTextWithSpaces += item.str + ' '
-      fullTextNoSpaces += item.str.toLowerCase().replace(/\s+/g, '')
-    })
-
-    return {
-      fullTextWithSpaces: normalizeWithSpaces(fullTextWithSpaces),
-      fullTextNoSpaces,
-      textPositions,
-    }
-  }, [normalizeWithSpaces])
-
-  // Create rect from text position
-  const createRectFromPosition = useCallback((pos: TextPosition, pageNumber: number) => {
-    const [, , , scaleY, x, y] = pos.transform
-    const height = pos.height
-    const yOffset = height * 0.15
-
-    return {
-      x1: x,
-      y1: y - yOffset,
-      x2: x + pos.width,
-      y2: y + height - yOffset,
-      width: pos.width,
-      height,
-      pageNumber,
-    }
-  }, [])
 
   // Find and create highlights when everything is ready
   useEffect(() => {
@@ -748,7 +183,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
           console.log(`[PDF]   Block ${i + 1}: "${block.substring(0, 60)}..."`)
 
-          let matchedLines: typeof pageTextMap.lines = []
+          const matchedLines: typeof pageTextMap.lines = []
 
           // Try finding matching lines using similarity
           for (const line of pageTextMap.lines) {
@@ -779,9 +214,8 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
             const blockWords = blockNormalized.split(' ').filter(w => w.length >= 5)
             const lineWords = lineNormalized.split(' ').filter(w => w.length >= 5)
             const sharedWords = blockWords.filter(w => lineWords.includes(w))
-            if (sharedWords.length >= 3 && sharedWords.length >= blockWords.length * 0.5) {
+            if (sharedWords.length >= 3 && sharedWords.length >= blockWords.length * 0.5)
               matchedLines.push(line)
-            }
           }
 
           if (matchedLines.length > 0) {
@@ -804,7 +238,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
             }
           }
           else {
-            console.log(`[PDF]       ✗ No matching lines found`)
+            console.log('[PDF]       ✗ No matching lines found')
           }
         }
 
@@ -840,14 +274,15 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
         setHighlights([newHighlight])
         console.log(`[PDF] 🎉 Created highlight with ${allMatchedRects.length} rects`)
-        console.log(`[PDF] Highlight object:`, newHighlight)
+        console.log('[PDF] Highlight object:', newHighlight)
 
         // Manually scroll to the highlight to trigger textLayer creation on that page
         if (scrollToRef.current) {
           console.log(`[PDF] 📜 Scrolling to highlight page ${apiPageNumber}...`)
           scrollToRef.current(newHighlight)
-        } else {
-          console.log(`[PDF] ⚠️ scrollTo function not available yet`)
+        }
+        else {
+          console.log('[PDF] ⚠️ scrollTo function not available yet')
         }
       }
       catch (error: any) {
@@ -914,10 +349,10 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         let lastY = -1
 
         for (const item of sortedItems) {
-          if (lastY >= 0 && Math.abs(item.y - lastY) > 5) {
+          if (lastY >= 0 && Math.abs(item.y - lastY) > 5)
             fullText += '\n'
-          }
-          fullText += item.text + ' '
+
+          fullText += `${item.text} `
           lastY = item.y
         }
 
@@ -984,7 +419,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         hasExtractedPageRef.current = apiPageNumber
 
         console.log(`[PDF] 📝 Page ${apiPageNumber} text map: ${textItems.length} items, ${lineGroups.length} lines`)
-        console.log(`[PDF] ✅ pageTextMap state updated - this should trigger highlighting now`)
+        console.log('[PDF] ✅ pageTextMap state updated - this should trigger highlighting now')
         console.log(`[PDF] 📦 ALL sentence boxes with positions (${lineGroups.length} lines):`)
         lineGroups.forEach((line, idx) => {
           const box = line.box
@@ -1013,7 +448,9 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     setViewerReady(true)
     console.log('[PDF] ✅ PdfHighlighter viewer is ready, scrollTo function received')
   }, [])
-  const onScrollChange = useCallback(() => {}, [])
+  const onScrollChange = useCallback(() => {
+    // No-op: PdfHighlighter requires this callback
+  }, [])
   const onSelectionFinished = useCallback(() => null, [])
 
   // Render highlights using built-in Highlight component
@@ -1045,13 +482,12 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         </div>
       )
     },
-    []
+    [],
   )
 
   // Don't render PDF until scale is calculated - prevents initial render at wrong scale
-  if (scale === null) {
+  if (scale === null)
     return <div className="h-full w-full" />
-  }
 
   if (!hasRendered.current) {
     hasRendered.current = true
@@ -1077,4 +513,134 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
   )
 }
 
+const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
+  url,
+  chunkId,
+  onFullTextExtracted,
+}) => {
+  const [pdfLoaded, setPdfLoaded] = useState(false)
+  const [apiLoaded, setApiLoaded] = useState(false)
+  const [fullChunkContext, setFullChunkContext] = useState<string | null>(null)
+  const [apiPageNumber, setApiPageNumber] = useState<number | null>(null)
+  const hasFetchedRef = useRef<string | null>(null)
+  const onFullTextExtractedRef = useRef(onFullTextExtracted)
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  // Keep callback ref updated
+  useEffect(() => {
+    onFullTextExtractedRef.current = onFullTextExtracted
+  }, [onFullTextExtracted])
+
+  // Reset PDF loaded state when URL changes
+  useEffect(() => {
+    setPdfLoaded(false)
+  }, [url])
+
+  // Check if everything is ready
+  const isReady = pdfLoaded && (apiLoaded || !chunkId)
+
+  // Fetch full content from API - only once per chunkId
+  useEffect(() => {
+    if (!chunkId) {
+      setApiLoaded(true)
+      return
+    }
+
+    // Skip if already fetched for this chunkId
+    if (hasFetchedRef.current === chunkId) return
+    hasFetchedRef.current = chunkId
+
+    setApiLoaded(false)
+    setFullChunkContext(null)
+    setApiPageNumber(null)
+    const fetchChunkContext = async () => {
+      console.log(`[PDF] Fetching chunk ${chunkId}...`)
+      try {
+        const response = await fetch(`${CHUNK_API_URL}?chunkID=${chunkId}`)
+        const text = await response.text()
+        console.log(`[PDF] Response: ${text.substring(0, 200)}`)
+
+        if (text) {
+          const data = JSON.parse(text)
+          console.log('[PDF] API data:', data)
+
+          if (data.chunk_context) {
+            // Handle double-encoded JSON string
+            let chunkText = data.chunk_context
+            if (typeof chunkText === 'string' && chunkText.startsWith('"') && chunkText.endsWith('"'))
+              chunkText = JSON.parse(chunkText) // Parse the inner JSON string
+
+            setFullChunkContext(chunkText)
+            console.log(`[PDF] Got context: ${chunkText.length} chars`)
+            if (onFullTextExtractedRef.current)
+              onFullTextExtractedRef.current(chunkText)
+          }
+          if (data.page_numbers && data.page_numbers.length > 0) {
+            setApiPageNumber(data.page_numbers[0])
+            console.log(`[PDF] API page number: ${data.page_numbers[0]}`)
+          }
+        }
+      }
+      catch (error: any) {
+        console.log(`[PDF] Error: ${error.message}`)
+      }
+      finally {
+        setApiLoaded(true)
+      }
+    }
+
+    fetchChunkContext()
+  }, [chunkId])
+
+  // Handle PDF document ready - delayed to ensure viewer is initialized
+  const handlePdfReady = useCallback(() => {
+    setTimeout(() => {
+      console.log('[PDF] PDF viewer ready')
+      setPdfLoaded(true)
+    }, 500)
+  }, [])
+
+  return (
+    <div
+      ref={containerRef}
+      className='relative h-full w-full overflow-hidden'
+      style={{ contain: 'layout' }}
+    >
+      {/* Loading overlay */}
+      {!isReady && (
+        <div className='absolute inset-0 z-50 flex flex-col items-center justify-center bg-white'>
+          <Loading type='app' />
+          <div className='mt-4 text-sm text-gray-500'>
+            {!pdfLoaded && !apiLoaded && 'Loading PDF and source text...'}
+            {!pdfLoaded && apiLoaded && 'Loading PDF...'}
+            {pdfLoaded && !apiLoaded && 'Loading source text...'}
+          </div>
+        </div>
+      )}
+
+      {/* PDF Viewer */}
+      <div
+        className='h-full w-full overflow-y-auto overflow-x-hidden'
+      >
+        <PdfLoader
+          key={url}
+          workerSrc='/pdf.worker.min.mjs'
+          url={url}
+          beforeLoad={<div />}
+        >
+          {pdfDocument => (
+            <PdfHighlighterStable
+              pdfDocument={pdfDocument}
+              onReady={handlePdfReady}
+              containerWidth={containerRef.current?.clientWidth || 600}
+              chunkContext={fullChunkContext}
+              isFullyReady={isReady}
+              apiPageNumber={apiPageNumber}
+            />
+          )}
+        </PdfLoader>
+      </div>
+    </div>
+  )
+}
 export default PdfViewerWithHighlight
