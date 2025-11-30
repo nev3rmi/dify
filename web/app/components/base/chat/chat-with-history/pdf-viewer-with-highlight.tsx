@@ -1310,9 +1310,194 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     // findHighlights()
   }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, calculateSimilarity, normalizeWithSpaces, normalizeNoSpaces, buildFullTextMap, createRectFromPosition])
 
+  // Extract full text from API page WITH positions
+  const [pageTextMap, setPageTextMap] = useState<{
+    items: Array<{
+      text: string
+      x: number
+      y: number
+      width: number
+      height: number
+    }>
+    fullText: string
+  } | null>(null)
+
+  const hasExtractedPageRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    if (!apiPageNumber || !pdfDocument || !scale) return
+
+    // Skip if already extracted for this page
+    if (hasExtractedPageRef.current === apiPageNumber) {
+      console.log(`[PDF] ⏭️ Already extracted page ${apiPageNumber}, skipping`)
+      return
+    }
+
+    const extractPageText = async () => {
+      try {
+        console.log(`[PDF] 📄 Extracting text from page ${apiPageNumber}...`)
+
+        const page = await pdfDocument.getPage(apiPageNumber)
+        const textContent = await page.getTextContent()
+        const items = textContent.items as any[]
+
+        console.log(`[PDF] 📄 Page ${apiPageNumber}: ${items.length} text items`)
+
+        // Store each text item with its position (deduplicate by position)
+        const textItemsMap = new Map<string, typeof textItems[0]>()
+
+        for (const item of items) {
+          if (!item.str || !item.str.trim()) continue
+
+          const x = item.transform[4]
+          const y = item.transform[5]
+          const key = `${x.toFixed(1)},${y.toFixed(1)},${item.str}` // Unique key
+
+          // Skip if duplicate at same position
+          if (textItemsMap.has(key)) continue
+
+          textItemsMap.set(key, {
+            text: item.str,
+            x,
+            y,
+            width: item.width,
+            height: item.height || Math.abs(item.transform[3]),
+          })
+        }
+
+        const textItems = Array.from(textItemsMap.values())
+
+        // Sort by Y (top to bottom), then X (left to right)
+        const sortedItems = [...textItems].sort((a, b) => {
+          const yDiff = b.y - a.y
+          if (Math.abs(yDiff) < 5) return a.x - b.x
+          return yDiff
+        })
+
+        // Build full text with line breaks
+        let fullText = ''
+        let lastY = -1
+
+        for (const item of sortedItems) {
+          if (lastY >= 0 && Math.abs(item.y - lastY) > 5) {
+            fullText += '\n'
+          }
+          fullText += item.text + ' '
+          lastY = item.y
+        }
+
+        // Clean up text
+        fullText = fullText.replace(/\b([a-zA-Z])\s+([a-z]+)/g, '$1$2') // Merge split words
+        fullText = fullText.replace(/ {2,}/g, ' ').trim()
+
+        setPageTextMap({
+          items: textItems,
+          fullText,
+        })
+
+        hasExtractedPageRef.current = apiPageNumber
+
+        // Group text items by line (Y position) to create sentence boxes
+        const lineGroups: Array<{
+          y: number
+          items: typeof textItems
+          text: string
+          box: { x1: number; y1: number; x2: number; y2: number }
+        }> = []
+
+        for (const item of sortedItems) {
+          // Find existing line group (within 5px Y)
+          const existingLine = lineGroups.find(line => Math.abs(line.y - item.y) < 5)
+
+          if (existingLine) {
+            existingLine.items.push(item)
+          }
+          else {
+            lineGroups.push({
+              y: item.y,
+              items: [item],
+              text: '',
+              box: { x1: 0, y1: 0, x2: 0, y2: 0 },
+            })
+          }
+        }
+
+        // Calculate bounding box and normalized text for each line
+        for (const line of lineGroups) {
+          // Sort items by X position (left to right)
+          const sortedLineItems = [...line.items].sort((a, b) => a.x - b.x)
+
+          let lineText = ''
+          for (let i = 0; i < sortedLineItems.length; i++) {
+            const item = sortedLineItems[i]
+            if (i === 0) {
+              lineText = item.text
+            }
+            else {
+              const prevItem = sortedLineItems[i - 1]
+              const lastChar = prevItem.text[prevItem.text.length - 1]
+              const firstChar = item.text[0]
+
+              // Merge if split word (lowercase to lowercase)
+              if (/[a-z]/.test(lastChar) && /[a-z]/.test(firstChar)) {
+                lineText += item.text
+              }
+              else {
+                lineText += ' ' + item.text
+              }
+            }
+          }
+
+          // Clean up
+          lineText = lineText.replace(/\b([a-zA-Z])\s+([a-z]+)/g, '$1$2') // Merge "o wner" → "owner"
+          lineText = lineText.replace(/ {2,}/g, ' ').trim()
+
+          line.text = lineText
+          line.box = {
+            x1: Math.min(...line.items.map(i => i.x)),
+            y1: Math.min(...line.items.map(i => i.y)),
+            x2: Math.max(...line.items.map(i => i.x + i.width)),
+            y2: Math.max(...line.items.map(i => i.y + i.height)),
+          }
+        }
+
+        console.log(`[PDF] 📝 Page ${apiPageNumber} text map: ${textItems.length} items, ${lineGroups.length} lines`)
+        console.log(`[PDF] 📦 ALL sentence boxes with positions (${lineGroups.length} lines):`)
+        lineGroups.forEach((line, idx) => {
+          const box = line.box
+          console.log(`[PDF]   Line ${idx + 1}: [${box.x1.toFixed(0)},${box.y1.toFixed(0)} → ${box.x2.toFixed(0)},${box.y2.toFixed(0)}]`)
+          console.log(`[PDF]           "${line.text}"`)
+        })
+        console.log(`[PDF] 📝 Full text (${fullText.length} chars):`)
+        console.log(fullText)
+      }
+      catch (error: any) {
+        console.log(`[PDF] ❌ Text extraction error: ${error.message}`)
+      }
+    }
+
+    extractPageText()
+  }, [apiPageNumber, pdfDocument, scale])
+
+  // Reset extraction when chunk context changes
+  useEffect(() => {
+    hasExtractedPageRef.current = null
+    setPageTextMap(null)
+  }, [chunkContext])
+
+  // Note: When highlights are enabled, PdfHighlighter auto-scrolls to show highlights
+  // No manual scrolling needed - the highlight's pageNumber triggers auto-scroll
+
+  // Memoize callbacks to prevent PdfHighlighter re-renders
+
+  // Note: When highlights are enabled, PdfHighlighter auto-scrolls to show highlights
+  // No manual scrolling needed - the highlight's pageNumber triggers auto-scroll
+
   // Memoize callbacks to prevent PdfHighlighter re-renders
   const enableAreaSelection = useCallback(() => false, [])
-  const scrollRef = useCallback(() => {}, [])
+  const scrollRef = useCallback(() => {
+    // No-op: we're using temporary highlights for scrolling instead
+  }, [])
   const onScrollChange = useCallback(() => {}, [])
   const onSelectionFinished = useCallback(() => null, [])
 
