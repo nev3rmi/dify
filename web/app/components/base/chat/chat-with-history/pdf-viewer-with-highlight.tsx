@@ -799,6 +799,39 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
             if (matchedIndices.length > 0) {
               totalMatched += matchedIndices.length
               blockRects = generateMatchedRects(matchedIndices, pdfTokens, pageNum)
+
+              // PASS 2.5: Sentence refinement - if token match is poor, try full sentences at that location
+              if (matchedIndices.length < blockTokens.length * 0.8) {
+                console.log(`[PDF]       Token match was ${(matchedIndices.length / blockTokens.length * 100).toFixed(0)}%, trying sentence refinement...`)
+
+                // Get Y range from matched tokens
+                const minMatchY = Math.min(...matchedIndices.map(idx => pdfTokens[idx].y))
+                const maxMatchY = Math.max(...matchedIndices.map(idx => pdfTokens[idx].y))
+                const yTolerance = 50
+
+                // Try sentence matching in this Y range
+                const sentenceRects: typeof blockRects = []
+                const normalizedBlock = normalizeWithSpaces(block)
+
+                for (const pos of textPositions) {
+                  const posY = pos.transform[5]
+                  if (posY < minMatchY - yTolerance || posY > maxMatchY + yTolerance) continue
+
+                  const posNormalized = normalizeWithSpaces(pos.text)
+
+                  // Check if this text matches the block
+                  if (posNormalized.length >= 5 && normalizedBlock.includes(posNormalized)) {
+                    sentenceRects.push(createRectFromPosition(pos, pageNum))
+                  }
+                }
+
+                if (sentenceRects.length > blockRects.length) {
+                  console.log(`[PDF]       ✓ Sentence refinement: ${sentenceRects.length} rects (vs ${blockRects.length} from tokens)`)
+                  blockRects = sentenceRects
+                  matchMethod = 'token+sentence'
+                  totalMatched = blockTokens.length
+                }
+              }
             }
           }
           else {
@@ -821,6 +854,37 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         }
 
         console.log(`[PDF] ✅ Total: ${totalMatched}/${totalTokens} tokens (${(totalMatched / totalTokens * 100).toFixed(0)}%)`)
+
+        // // PASS 4: Fill gaps between min/max Y of existing matches
+        // const minY = Math.min(...allMatchedRects.map(r => r.y1))
+        // const maxY = Math.max(...allMatchedRects.map(r => r.y2))
+        // let gapsFilled = 0
+
+        // for (const pos of textPositions) {
+        //   const posNormalized = normalizeWithSpaces(pos.text)
+        //   if (posNormalized.length < 2) continue
+
+        //   const y = pos.transform[5]
+        //   const height = pos.height
+        //   const posTop = y - height * 0.15
+        //   const posBottom = y + height - height * 0.15
+
+        //   // Check if this position is within Y range
+        //   if (posTop >= minY - 5 && posBottom <= maxY + 5) {
+        //     // Check if not already added
+        //     const exists = allMatchedRects.some(r =>
+        //       Math.abs(r.x1 - pos.transform[4]) < 1 && Math.abs(r.y1 - (y - height * 0.15)) < 1
+        //     )
+        //     if (!exists) {
+        //       allMatchedRects.push(createRectFromPosition(pos, pageNum))
+        //       gapsFilled++
+        //     }
+        //   }
+        // }
+
+        // if (gapsFilled > 0) {
+        //   console.log(`[PDF] 🔧 Filled ${gapsFilled} gaps within Y range ${minY.toFixed(0)}-${maxY.toFixed(0)}`)
+        // }
 
         // Create ONE highlight from ALL matched rects
         const boundingRect = {
