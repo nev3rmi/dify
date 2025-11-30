@@ -840,6 +840,39 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
           }
 
           if (blockRects.length > 0) {
+            // PASS 3: Per-block gap filling if many rects matched (indicates continuous text)
+            if (blockRects.length >= 10) {
+              const blockMinY = Math.min(...blockRects.map(r => r.y1))
+              const blockMaxY = Math.max(...blockRects.map(r => r.y2))
+              let blockGapsFilled = 0
+
+              for (const pos of textPositions) {
+                const posNormalized = normalizeWithSpaces(pos.text)
+                if (posNormalized.length < 2) continue
+
+                const y = pos.transform[5]
+                const height = pos.height
+                const posTop = y - height * 0.15
+                const posBottom = y + height - height * 0.15
+
+                // Check if within this block's Y range
+                if (posTop >= blockMinY - 5 && posBottom <= blockMaxY + 5) {
+                  // Check if not already added
+                  const exists = blockRects.some(r =>
+                    Math.abs(r.x1 - pos.transform[4]) < 1 && Math.abs(r.y1 - (y - height * 0.15)) < 1
+                  )
+                  if (!exists) {
+                    blockRects.push(createRectFromPosition(pos, pageNum))
+                    blockGapsFilled++
+                  }
+                }
+              }
+
+              if (blockGapsFilled > 0) {
+                console.log(`[PDF]       Gap-filled: +${blockGapsFilled} rects in Y range ${blockMinY.toFixed(0)}-${blockMaxY.toFixed(0)}`)
+              }
+            }
+
             console.log(`[PDF]   ✓ Block ${i + 1}: ${matchMethod} → ${blockRects.length} rects (${block.substring(0, 30)}...)`)
             allMatchedRects.push(...blockRects)
           }
