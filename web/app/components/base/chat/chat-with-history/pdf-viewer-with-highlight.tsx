@@ -544,8 +544,28 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
   const hasCalledReady = useRef(false)
   const hasRendered = useRef(false)
   const hasHighlightedRef = useRef(false)
+  const hasExtractedPageRef = useRef<number | null>(null)
   const [scale, setScale] = useState<string | null>(null)
   const [highlights, setHighlights] = useState<IHighlight[]>([])
+
+  // Page text map with line boxes
+  interface LineGroup {
+    y: number
+    text: string
+    box: { x1: number; y1: number; x2: number; y2: number }
+  }
+
+  const [pageTextMap, setPageTextMap] = useState<{
+    items: Array<{
+      text: string
+      x: number
+      y: number
+      width: number
+      height: number
+    }>
+    lines: LineGroup[]
+    fullText: string
+  } | null>(null)
 
   console.log('[PDF] PdfHighlighterStable render, hasRendered:', hasRendered.current)
 
@@ -553,7 +573,9 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
   useEffect(() => {
     console.log('[PDF] ChunkContext changed, resetting highlights')
     hasHighlightedRef.current = false
+    hasExtractedPageRef.current = null
     setHighlights([])
+    setPageTextMap(null)
   }, [chunkContext])
 
   // Similarity scoring function (bigram)
@@ -670,9 +692,132 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
   // Find and create highlights when everything is ready
   useEffect(() => {
-    // ========== COMMENTED OUT FOR TESTING - NO HIGHLIGHTING ==========
-    console.log('[PDF] Highlighting is disabled for testing')
-    return
+    if (!isFullyReady || !chunkContext || !pdfDocument || !pageTextMap || hasHighlightedRef.current) return
+    hasHighlightedRef.current = true
+
+    const findHighlights = async () => {
+      console.log('[PDF] 🚀 Starting simple fuzzy matching...')
+      console.log('[PDF] Chunk context:', chunkContext.substring(0, 200))
+
+      try {
+        const pageNum = apiPageNumber || 1
+
+        // Split chunk into blocks
+        const chunkBlocks = chunkContext
+          .split('\n')
+          .map(s => s.trim())
+          .filter(s => s.length > 10)
+
+        console.log(`[PDF] 📝 ${chunkBlocks.length} chunk blocks to match`)
+
+        const allMatchedRects: Array<{ x1: number; y1: number; x2: number; y2: number; width: number; height: number; pageNumber: number }> = []
+
+        // Match each chunk block against PDF lines using fuzzy matching
+        for (let i = 0; i < chunkBlocks.length; i++) {
+          const block = chunkBlocks[i]
+          const blockNormalized = normalizeWithSpaces(block)
+
+          console.log(`[PDF]   Block ${i + 1}: "${block.substring(0, 60)}..."`)
+
+          let matchedLines: typeof pageTextMap.lines = []
+
+          // Try finding matching lines using similarity
+          for (const line of pageTextMap.lines) {
+            const lineNormalized = normalizeWithSpaces(line.text)
+
+            // Check 1: Exact substring
+            if (blockNormalized.includes(lineNormalized) && lineNormalized.length >= 10) {
+              matchedLines.push(line)
+              continue
+            }
+
+            // Check 2: Line is substring of block
+            if (lineNormalized.includes(blockNormalized) && blockNormalized.length >= 10) {
+              matchedLines.push(line)
+              continue
+            }
+
+            // Check 3: High similarity (using our bigram function)
+            if (lineNormalized.length >= 20 && blockNormalized.length >= 20) {
+              const similarity = calculateSimilarity(lineNormalized, blockNormalized)
+              if (similarity >= 0.7) {
+                matchedLines.push(line)
+                continue
+              }
+            }
+
+            // Check 4: Many shared words
+            const blockWords = blockNormalized.split(' ').filter(w => w.length >= 5)
+            const lineWords = lineNormalized.split(' ').filter(w => w.length >= 5)
+            const sharedWords = blockWords.filter(w => lineWords.includes(w))
+            if (sharedWords.length >= 3 && sharedWords.length >= blockWords.length * 0.5) {
+              matchedLines.push(line)
+            }
+          }
+
+          if (matchedLines.length > 0) {
+            console.log(`[PDF]       ✓ Matched ${matchedLines.length} lines:`)
+            // Create rects from matched lines (full line box)
+            for (const line of matchedLines) {
+              const lineIdx = pageTextMap.lines.indexOf(line)
+              console.log(`[PDF]           Line ${lineIdx + 1}: "${line.text.substring(0, 60)}..."`)
+
+              const yOffset = (line.box.y2 - line.box.y1) * 0.15
+              allMatchedRects.push({
+                x1: line.box.x1,
+                y1: line.box.y1 - yOffset,
+                x2: line.box.x2,
+                y2: line.box.y2 - yOffset,
+                width: line.box.x2 - line.box.x1,
+                height: line.box.y2 - line.box.y1,
+                pageNumber: pageNum,
+              })
+            }
+          }
+          else {
+            console.log(`[PDF]       ✗ No matching lines found`)
+          }
+        }
+
+        if (allMatchedRects.length === 0) {
+          console.log('[PDF] ⚠️ No matches found')
+          return
+        }
+
+        console.log(`[PDF] ✅ Matched ${allMatchedRects.length} rects`)
+
+        // Create highlight
+        const boundingRect = {
+          x1: Math.min(...allMatchedRects.map(r => r.x1)),
+          y1: Math.min(...allMatchedRects.map(r => r.y1)),
+          x2: Math.max(...allMatchedRects.map(r => r.x2)),
+          y2: Math.max(...allMatchedRects.map(r => r.y2)),
+          width: 612,
+          height: 792,
+          pageNumber: pageNum,
+        }
+
+        const newHighlight: IHighlight = {
+          id: `highlight-${Date.now()}`,
+          position: {
+            boundingRect,
+            rects: allMatchedRects,
+            pageNumber: pageNum,
+            usePdfCoordinates: true,
+          } as ScaledPosition,
+          content: { text: chunkContext },
+          comment: { text: '', emoji: '' },
+        }
+
+        setHighlights([newHighlight])
+        console.log(`[PDF] 🎉 Created highlight with ${allMatchedRects.length} rects`)
+      }
+      catch (error: any) {
+        console.error('[PDF] ❌ Highlight error:', error)
+      }
+    }
+
+    findHighlights()
     // if (!isFullyReady || !chunkContext || !pdfDocument || hasHighlightedRef.current) return
     // hasHighlightedRef.current = true
 
@@ -1308,22 +1453,9 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     // }
     //
     // findHighlights()
-  }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, calculateSimilarity, normalizeWithSpaces, normalizeNoSpaces, buildFullTextMap, createRectFromPosition])
+  }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, pageTextMap, normalizeWithSpaces])
 
   // Extract full text from API page WITH positions
-  const [pageTextMap, setPageTextMap] = useState<{
-    items: Array<{
-      text: string
-      x: number
-      y: number
-      width: number
-      height: number
-    }>
-    fullText: string
-  } | null>(null)
-
-  const hasExtractedPageRef = useRef<number | null>(null)
-
   useEffect(() => {
     if (!apiPageNumber || !pdfDocument || !scale) return
 
@@ -1390,13 +1522,6 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         fullText = fullText.replace(/\b([a-zA-Z])\s+([a-z]+)/g, '$1$2') // Merge split words
         fullText = fullText.replace(/ {2,}/g, ' ').trim()
 
-        setPageTextMap({
-          items: textItems,
-          fullText,
-        })
-
-        hasExtractedPageRef.current = apiPageNumber
-
         // Group text items by line (Y position) to create sentence boxes
         const lineGroups: Array<{
           y: number
@@ -1427,30 +1552,14 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
           // Sort items by X position (left to right)
           const sortedLineItems = [...line.items].sort((a, b) => a.x - b.x)
 
-          let lineText = ''
-          for (let i = 0; i < sortedLineItems.length; i++) {
-            const item = sortedLineItems[i]
-            if (i === 0) {
-              lineText = item.text
-            }
-            else {
-              const prevItem = sortedLineItems[i - 1]
-              const lastChar = prevItem.text[prevItem.text.length - 1]
-              const firstChar = item.text[0]
+          // Keep it simple: join with spaces, rely on fuzzy matching later
+          let lineText = sortedLineItems.map(i => i.text).join(' ')
 
-              // Merge if split word (lowercase to lowercase)
-              if (/[a-z]/.test(lastChar) && /[a-z]/.test(firstChar)) {
-                lineText += item.text
-              }
-              else {
-                lineText += ' ' + item.text
-              }
-            }
-          }
+          // Only fix obvious single-letter splits: "o wner" → "owner"
+          lineText = lineText.replace(/\b([a-zA-Z])\s+([a-z]+\w*)/g, '$1$2')
 
-          // Clean up
-          lineText = lineText.replace(/\b([a-zA-Z])\s+([a-z]+)/g, '$1$2') // Merge "o wner" → "owner"
-          lineText = lineText.replace(/ {2,}/g, ' ').trim()
+          // Clean up spacing
+          lineText = lineText.replace(/\s+/g, ' ').trim()
 
           line.text = lineText
           line.box = {
@@ -1460,6 +1569,15 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
             y2: Math.max(...line.items.map(i => i.y + i.height)),
           }
         }
+
+        // Store text map with lines
+        setPageTextMap({
+          items: textItems,
+          lines: lineGroups.map(lg => ({ y: lg.y, text: lg.text, box: lg.box })),
+          fullText,
+        })
+
+        hasExtractedPageRef.current = apiPageNumber
 
         console.log(`[PDF] 📝 Page ${apiPageNumber} text map: ${textItems.length} items, ${lineGroups.length} lines`)
         console.log(`[PDF] 📦 ALL sentence boxes with positions (${lineGroups.length} lines):`)
@@ -1478,12 +1596,6 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
     extractPageText()
   }, [apiPageNumber, pdfDocument, scale])
-
-  // Reset extraction when chunk context changes
-  useEffect(() => {
-    hasExtractedPageRef.current = null
-    setPageTextMap(null)
-  }, [chunkContext])
 
   // Note: When highlights are enabled, PdfHighlighter auto-scrolls to show highlights
   // No manual scrolling needed - the highlight's pageNumber triggers auto-scroll
