@@ -12,8 +12,8 @@ declare -a failed_chunks
 declare -a failed_details
 declare -i total=0 passed=0 failed=0 skipped=0
 
-# Test chunks 1-50
-for i in {1..50}; do
+# Test chunks 1-43 (maximum in database)
+for i in {1..43}; do
   result=$(node scripts/test-matching-logic.js --chunkId=$i 2>&1)
 
   # Check if chunk exists and is testable
