@@ -2,6 +2,8 @@ import React, { memo, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useChatWithHistoryContext } from '../context'
 import Input from '@/app/components/base/input'
+// CUSTOM: Project selector for projectKey field (re-apply after upstream sync)
+import ProjectSelector from '@/app/components/custom/project-session-selector/project-selector'
 import Textarea from '@/app/components/base/textarea'
 import { PortalSelect } from '@/app/components/base/select'
 import { FileUploaderInAttachmentWrapper } from '@/app/components/base/file-uploader'
@@ -53,7 +55,11 @@ const InputsFormContent = ({ showTip }: Props) => {
               )}
             </div>
           )}
-          {form.type === InputVarType.textInput && (
+          {/* CUSTOM: ProjectSelector for projectKey text-input field (re-apply after upstream sync) */}
+          {form.type === InputVarType.textInput && form.variable === 'projectKey' && (
+            <ProjectSelector />
+          )}
+          {form.type === InputVarType.textInput && form.variable !== 'projectKey' && (
             <Input
               value={inputsFormValue?.[form.variable] || ''}
               onChange={e => handleFormChange(form.variable, e.target.value)}
@@ -83,7 +89,11 @@ const InputsFormContent = ({ showTip }: Props) => {
               onChange={value => handleFormChange(form.variable, value)}
             />
           )}
-          {form.type === InputVarType.select && (
+          {/* CUSTOM: ProjectSelector for projectKey field (re-apply after upstream sync) */}
+          {form.type === InputVarType.select && form.variable === 'projectKey' && (
+            <ProjectSelector />
+          )}
+          {form.type === InputVarType.select && form.variable !== 'projectKey' && (
             <PortalSelect
               popupClassName='w-[200px]'
               value={inputsFormValue?.[form.variable] ?? form.default ?? ''}
