@@ -25,24 +25,22 @@ const CHUNK_API_URL = 'https://n8n.toho.vn/webhook/dbf0d2ae-ec68-4827-bdb7-f5dec
 type PdfHighlighterStableProps = {
   pdfDocument: any
   onReady: () => void
-  containerWidth: number
+  _containerWidth: number
   chunkContext: string | null
   isFullyReady: boolean
   apiPageNumber: number | null
   apiPageNumbers: number[]
 }
 
-const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onReady, containerWidth, chunkContext, isFullyReady, apiPageNumber, apiPageNumbers }) => {
+const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onReady, _containerWidth, chunkContext, isFullyReady, apiPageNumber, apiPageNumbers }) => {
   const hasCalledReady = useRef(false)
   const hasRendered = useRef(false)
   const hasHighlightedRef = useRef(false)
   const hasExtractedPagesRef = useRef<Set<number>>(new Set())
   const scrollToRef = useRef<((highlight: IHighlight) => void) | null>(null)
   const [scale, setScale] = useState<string | null>(null)
-  const [scaleReady, setScaleReady] = useState(false) // Track if scale is ready for current chunk
   const [highlights, setHighlights] = useState<IHighlight[]>([])
-  const [viewerReady, setViewerReady] = useState(false)
-  const [renderingComplete, setRenderingComplete] = useState(false) // True after PDF has settled
+  const [_viewerReady, setViewerReady] = useState(false)
 
   // Page text map with line boxes
   type LineGroup = {
@@ -74,53 +72,19 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
   // Reset highlights when chunkContext changes (new citation clicked)
   useEffect(() => {
-    console.log('[PDF] ChunkContext changed, resetting highlights and scale')
+    console.log('[PDF] ChunkContext changed, resetting highlights')
     hasHighlightedRef.current = false
     hasExtractedPagesRef.current.clear()
-    // Don't reset viewerReady - it's tied to viewer instance, not chunk
-    // The key={chunkId} handles remounting for different chunks
     setHighlights([])
     setPageTextMap(null)
-    setScaleReady(false) // Force scale recalculation for this chunk
-    setScale(null) // Reset scale to trigger recalculation
-    setRenderingComplete(false) // Wait for PDF to fully render again
   }, [chunkContext])
 
-  // Wait for PDF to fully settle after viewerReady
+  // Set fixed scale once on mount
   useEffect(() => {
-    if (!viewerReady || !scaleReady || renderingComplete) return
-
-    console.log('[PDF] ⏳ Waiting for PDF rendering to settle...')
-    const timer = setTimeout(() => {
-      console.log('[PDF] ✅ PDF rendering complete, ready for highlights')
-      setRenderingComplete(true)
-    }, 500) // 500ms delay to let PDF fully render
-
-    return () => clearTimeout(timer)
-  }, [viewerReady, scaleReady, renderingComplete])
-
-  // Calculate scale ONCE and lock it - don't recalculate when container resizes
-  // This prevents race conditions where highlights are at wrong position
-  useEffect(() => {
-    if (!pdfDocument || scaleReady) return
-
-    const calculateScale = async () => {
-      try {
-        // Use a fixed reasonable scale to avoid layout-dependent calculations
-        const fixedScale = 0.55
-        console.log(`[PDF] 📐 Using FIXED scale: ${fixedScale} (prevents layout race condition)`)
-        setScale(fixedScale.toString())
-        setScaleReady(true)
-      }
-      catch {
-        console.log('[PDF] Scale calculation failed, using default')
-        setScale('1.0')
-        setScaleReady(true)
-      }
-    }
-
-    calculateScale()
-  }, [pdfDocument, scaleReady])
+    if (!pdfDocument || scale) return
+    console.log('[PDF] 📐 Setting fixed scale: 0.55')
+    setScale('0.55')
+  }, [pdfDocument, scale])
 
   useEffect(() => {
     if (!hasCalledReady.current && scale !== null) {
@@ -204,14 +168,11 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
       hasPdfDoc: !!pdfDocument,
       hasPageTextMap: !!pageTextMap,
       hasRendered: hasRendered.current,
-      renderingComplete,
-      hasHighlighted: hasHighlightedRef.current,
       hasScrollTo: !!scrollToRef.current,
+      hasHighlighted: hasHighlightedRef.current,
     })
 
-    // Wait for renderingComplete - this fires 500ms after viewerReady+scaleReady
-    // This ensures PDF has FULLY finished rendering at final scale
-    if (!isFullyReady || !chunkContext || !pdfDocument || !pageTextMap || !hasRendered.current || !renderingComplete || hasHighlightedRef.current) return
+    if (!isFullyReady || !chunkContext || !pdfDocument || !pageTextMap || !hasRendered.current || hasHighlightedRef.current) return
 
     console.log('[PDF] ✅ All dependencies ready, starting highlighting...')
     hasHighlightedRef.current = true
@@ -369,16 +330,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
         setHighlights([newHighlight])
         console.log(`[PDF] 🎉 Created highlight with ${allMatchedRects.length} rects`)
-        console.log('[PDF] Highlight object:', newHighlight)
-
-        // Manually scroll to the highlight to trigger textLayer creation on that page
-        if (scrollToRef.current) {
-          console.log(`[PDF] 📜 Scrolling to API page ${pageNum}...`)
-          scrollToRef.current(newHighlight)
-        }
-        else {
-          console.log('[PDF] ⚠️ scrollTo function not available yet')
-        }
+        // scrollTo is handled in separate useEffect after highlights render
       }
       catch (error: any) {
         console.error('[PDF] ❌ Highlight error:', error)
@@ -386,7 +338,16 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     }
 
     findHighlights()
-  }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, pageTextMap, renderingComplete, normalizeWithSpaces, normalizeNoSpaces, wordBagMatch, calculateLevenshteinSimilarity])
+  }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, pageTextMap, normalizeWithSpaces, normalizeNoSpaces, wordBagMatch, calculateLevenshteinSimilarity])
+
+  // Scroll to highlight AFTER it's rendered - this is the final step
+  useEffect(() => {
+    if (highlights.length === 0 || !scrollToRef.current) return
+
+    const highlight = highlights[0]
+    console.log(`[PDF] 📜 Scrolling to highlight on page ${highlight.position.pageNumber}...`)
+    scrollToRef.current(highlight)
+  }, [highlights])
 
   // Extract full text from ALL API pages WITH positions
   useEffect(() => {
@@ -756,7 +717,7 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
               key={chunkId}
               pdfDocument={pdfDocument}
               onReady={handlePdfReady}
-              containerWidth={containerRef.current?.clientWidth || 600}
+              _containerWidth={containerRef.current?.clientWidth || 600}
               chunkContext={fullChunkContext}
               isFullyReady={isReady}
               apiPageNumber={apiPageNumber}
