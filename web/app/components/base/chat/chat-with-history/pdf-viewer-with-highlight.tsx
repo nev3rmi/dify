@@ -206,11 +206,30 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
               // Calculate similarity using Levenshtein distance
               const similarity = calculateLevenshteinSimilarity(blockNormalized, windowText)
 
-              // Also check exact substring match
+              // Check substring in BOTH directions (needed for multi-column PDFs)
               const isSubstring = windowText.includes(blockNormalized) || blockNormalized.includes(windowText)
 
-              // Score: prefer exact match, otherwise use similarity
-              const score = isSubstring ? 1.0 : similarity
+              let score = isSubstring ? 1.0 : similarity
+
+              // Special handling for short blocks (<60 chars): word-bag matching
+              // Helps with headers/titles/URLs where word order may differ
+              if (blockNormalized.length < 60 && score < 0.75) {
+                const blockWords = blockNormalized.split(' ').filter(w => w.length >= 3)
+                const windowWords = windowText.split(' ').filter(w => w.length >= 3)
+
+                // Check if ALL block words exist in window (order-independent)
+                const allWordsPresent = blockWords.length > 0
+                  && blockWords.every(w => windowWords.some(ww => ww.includes(w) || w.includes(ww)))
+
+                // SAFEGUARD: Window shouldn't be much longer than block (prevent false positives)
+                const lengthRatio = windowText.length / blockNormalized.length
+                const acceptableLength = lengthRatio <= 2.0 // At most 2x longer
+
+                if (allWordsPresent && acceptableLength) {
+                  score = 0.85 // Good enough for short blocks
+                  console.log(`[PDF]           (word-bag match for short block, ratio: ${lengthRatio.toFixed(1)}x)`)
+                }
+              }
 
               if (!bestMatch || score > bestMatch.score)
                 bestMatch = { lines: windowLines, score }

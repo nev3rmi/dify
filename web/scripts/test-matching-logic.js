@@ -11,6 +11,8 @@
  */
 
 const https = require('https')
+const fs = require('fs')
+const { execSync } = require('child_process')
 
 const CHUNK_API_URL = 'https://n8n.toho.vn/webhook/dbf0d2ae-ec68-4827-bdb7-f5dec29c2b1d'
 
@@ -85,11 +87,27 @@ function matchChunkToLines(chunkContext, pdfLines) {
         // Calculate similarity
         const similarity = calculateLevenshteinSimilarity(blockNormalized, windowText)
 
-        // Check exact substring
+        // Check substring in BOTH directions
         const isSubstring = windowText.includes(blockNormalized) || blockNormalized.includes(windowText)
 
-        // Score: prefer exact match
-        const score = isSubstring ? 1.0 : similarity
+        let score = isSubstring ? 1.0 : similarity
+
+        // Special handling for short blocks: word-bag matching
+        if (blockNormalized.length < 60 && score < 0.75) {
+          const blockWords = blockNormalized.split(' ').filter(w => w.length >= 3)
+          const windowWords = windowText.split(' ').filter(w => w.length >= 3)
+
+          const allWordsPresent = blockWords.length > 0
+            && blockWords.every(w => windowWords.some(ww => ww.includes(w) || w.includes(ww)))
+
+          // SAFEGUARD: Prevent false positives - window max 2x block length
+          const lengthRatio = windowText.length / blockNormalized.length
+          const acceptableLength = lengthRatio <= 2.0
+
+          if (allWordsPresent && acceptableLength) {
+            score = 0.85
+          }
+        }
 
         if (!bestMatch || score > bestMatch.score) {
           bestMatch = {
@@ -98,7 +116,6 @@ function matchChunkToLines(chunkContext, pdfLines) {
             endLineIdx: startIdx + windowSize - 1,
             lines: windowLines,
             score,
-            isSubstring,
           }
         }
       }
@@ -151,19 +168,38 @@ async function fetchChunkData(chunkId) {
   })
 }
 
-function mockPDFLines(chunkContext) {
-  // For now, create mock PDF lines from the chunk itself
-  // In real test, you'd extract these from actual PDF
-  console.log('\n⚠️  Using MOCK PDF lines (chunk text split by sentences)')
-  console.log('   For real test, need to extract actual PDF text\n')
+function extractRealPDFLines(pdfPath, pageNumber) {
+  console.log(`\n📄 Extracting REAL PDF text using pdfjs-dist...`)
 
-  const sentences = chunkContext
-    .replace(/([.!?])\s+/g, '$1\n')
-    .split('\n')
-    .map(s => s.trim())
-    .filter(s => s.length > 0)
+  try {
+    // Call extract-pdf-lines.js to get real PDF text
+    const outputPath = `/tmp/pdf-lines-p${pageNumber}.json`
 
-  return sentences
+    const cmd = `node scripts/extract-pdf-lines.js --pdf="${pdfPath}" --page=${pageNumber} --output="${outputPath}" 2>/dev/null`
+    execSync(cmd)
+
+    if (!fs.existsSync(outputPath)) {
+      throw new Error(`Failed to extract PDF lines`)
+    }
+
+    const data = JSON.parse(fs.readFileSync(outputPath, 'utf8'))
+    console.log(`✅ Extracted ${data.lines.length} real PDF lines\n`)
+
+    return data.lines
+  }
+  catch (error) {
+    console.error(`⚠️  Could not extract real PDF text: ${error.message}`)
+    console.log('   Falling back to mock lines\n')
+
+    // Fallback to mock
+    const sentences = chunkContext
+      .replace(/([.!?])\s+/g, '$1\n')
+      .split('\n')
+      .map(s => s.trim())
+      .filter(s => s.length > 0)
+
+    return sentences
+  }
 }
 
 async function testChunk(chunkId) {
@@ -186,8 +222,9 @@ async function testChunk(chunkId) {
     console.log(`   Page: ${pageNumber}`)
     console.log(`   Length: ${chunkContext.length} chars`)
 
-    // Mock PDF lines (in real test, extract from actual PDF)
-    const pdfLines = mockPDFLines(chunkContext)
+    // Extract REAL PDF lines from actual PDF
+    const pdfFilePath = `/tmp/test-pdfs/${pdfPath.split('/').pop()}`
+    const pdfLines = extractRealPDFLines(pdfFilePath, pageNumber)
 
     console.log(`\n📄 PDF Lines: ${pdfLines.length}`)
     pdfLines.forEach((line, i) => {
