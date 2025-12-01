@@ -28,7 +28,41 @@ const chunkId = args.chunkId || '2'
 // ============ MATCHING LOGIC (copied from component) ============
 
 function normalizeWithSpaces(text) {
-  return text.toLowerCase().replace(/\s+/g, ' ').trim()
+  return text
+    .toLowerCase()
+    .replace(/[^\w\s]/g, '') // Remove punctuation
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function normalizeNoSpaces(text) {
+  return text
+    .toLowerCase()
+    .replace(/[^\w]/g, '') // Remove all non-alphanumeric
+}
+
+function wordBagMatch(lineText, blockText) {
+  // Filter out common short words
+  const stopWords = new Set(['the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'was', 'one', 'our', 'out'])
+  const lineWords = lineText.toLowerCase().split(/\s+/).filter(w => w.length > 3 && !stopWords.has(w))
+  const blockWords = blockText.toLowerCase().split(/\s+/).filter(w => w.length > 3 && !stopWords.has(w))
+
+  if (lineWords.length === 0) return 0
+
+  // Count how many line words appear in block
+  let matchedWords = 0
+  for (const word of lineWords) {
+    // Require exact match or very similar length substring (within 1.5x ratio)
+    const exactMatch = blockWords.some(bw => bw === word)
+    const substringMatch = blockWords.some(bw => {
+      const shorter = Math.min(bw.length, word.length)
+      const longer = Math.max(bw.length, word.length)
+      return shorter >= 5 && longer / shorter <= 1.5 && (bw.includes(word) || word.includes(bw))
+    })
+    if (exactMatch || substringMatch) matchedWords++
+  }
+
+  return matchedWords / lineWords.length
 }
 
 function levenshteinDistance(str1, str2) {
@@ -71,67 +105,64 @@ function matchChunkToLines(chunkContext, pdfLines) {
 
   const results = []
 
-  // Match each chunk block using sliding window
-  for (let i = 0; i < chunkBlocks.length; i++) {
-    const block = chunkBlocks[i]
+  // SEQUENTIAL PARAGRAPH MATCHING: Find ALL lines that belong to each block
+  let lastMatchedLineIdx = -1
+
+  for (let blockIdx = 0; blockIdx < chunkBlocks.length; blockIdx++) {
+    const block = chunkBlocks[blockIdx]
     const blockNormalized = normalizeWithSpaces(block)
 
-    let bestMatch = null
+    // Find ALL PDF lines whose text appears in this chunk block
+    const matchingLines = []
 
-    // Try windows of 1-5 consecutive PDF lines
-    for (let windowSize = 1; windowSize <= Math.min(5, pdfLines.length); windowSize++) {
-      for (let startIdx = 0; startIdx <= pdfLines.length - windowSize; startIdx++) {
-        const windowLines = pdfLines.slice(startIdx, startIdx + windowSize)
-        const windowText = normalizeWithSpaces(windowLines.join(' '))
+    for (let lineIdx = lastMatchedLineIdx + 1; lineIdx < pdfLines.length; lineIdx++) {
+      const line = pdfLines[lineIdx]
+      const lineNormalized = normalizeWithSpaces(line)
 
-        // Calculate similarity
-        const similarity = calculateLevenshteinSimilarity(blockNormalized, windowText)
+      // Skip very short lines
+      if (lineNormalized.length < 8) continue
 
-        // Check substring in BOTH directions
-        const isSubstring = windowText.includes(blockNormalized) || blockNormalized.includes(windowText)
+      // Check if this PDF line's text appears in the chunk block
+      const lineInBlock = blockNormalized.includes(lineNormalized)
 
-        let score = isSubstring ? 1.0 : similarity
+      // Also check if block appears in line (for short blocks)
+      const blockInLine = lineNormalized.includes(blockNormalized)
 
-        // Special handling for short blocks: word-bag matching
-        if (blockNormalized.length < 60 && score < 0.75) {
-          const blockWords = blockNormalized.split(' ').filter(w => w.length >= 3)
-          const windowWords = windowText.split(' ').filter(w => w.length >= 3)
+      // Check with no spaces (handles "sciencenewst oday" vs "sciencenewstoday")
+      const lineNoSpaces = normalizeNoSpaces(line)
+      const blockNoSpaces = normalizeNoSpaces(block)
+      const lineInBlockNoSpaces = blockNoSpaces.includes(lineNoSpaces)
+      const blockInLineNoSpaces = lineNoSpaces.includes(blockNoSpaces)
 
-          const allWordsPresent = blockWords.length > 0
-            && blockWords.every(w => windowWords.some(ww => ww.includes(w) || w.includes(ww)))
+      // Word-bag matching (handles word order differences)
+      // Stricter threshold for short blocks to avoid false positives
+      const lengthRatio = Math.max(lineNormalized.length, blockNormalized.length) / Math.min(lineNormalized.length, blockNormalized.length)
+      const wordBagScore = lengthRatio <= 3 ? wordBagMatch(line, block) : 0
+      const wordBagThreshold = blockNormalized.length < 60 ? 0.95 : 0.8
 
-          // SAFEGUARD: Prevent false positives - window max 2x block length
-          const lengthRatio = windowText.length / blockNormalized.length
-          const acceptableLength = lengthRatio <= 2.0
+      // Fallback: high Levenshtein similarity
+      const similarity = calculateLevenshteinSimilarity(lineNormalized, blockNormalized)
 
-          if (allWordsPresent && acceptableLength) {
-            score = 0.85
-          }
-        }
-
-        if (!bestMatch || score > bestMatch.score) {
-          bestMatch = {
-            windowSize,
-            startLineIdx: startIdx,
-            endLineIdx: startIdx + windowSize - 1,
-            lines: windowLines,
-            score,
-          }
-        }
+      if (lineInBlock || blockInLine || lineInBlockNoSpaces || blockInLineNoSpaces || wordBagScore >= wordBagThreshold || similarity >= 0.75) {
+        matchingLines.push({ line, lineIdx })
       }
     }
 
-    const threshold = 0.75
-    const matched = bestMatch && bestMatch.score >= threshold
+    // Update last matched position to maintain sequential order
+    if (matchingLines.length > 0) {
+      lastMatchedLineIdx = Math.max(lastMatchedLineIdx, ...matchingLines.map(m => m.lineIdx))
+    }
+
+    const matched = matchingLines.length > 0
 
     results.push({
-      blockIndex: i,
+      blockIndex: blockIdx,
       blockText: block,
       blockLength: block.length,
       matched,
-      score: bestMatch?.score || 0,
-      matchedLines: matched ? bestMatch.lines : [],
-      lineIndices: matched ? `${bestMatch.startLineIdx}-${bestMatch.endLineIdx}` : 'none',
+      linesMatched: matchingLines.length,
+      matchedLines: matchingLines.map(m => m.line),
+      lineIndices: matched ? matchingLines.map(m => m.lineIdx).join(',') : 'none',
     })
   }
 
@@ -251,9 +282,11 @@ async function testChunk(chunkId) {
     results.forEach(r => {
       const status = r.matched ? '✓' : '✗'
       console.log(`${status} Block ${r.blockIndex + 1}: ${r.blockText.substring(0, 50)}...`)
-      console.log(`   Score: ${r.score.toFixed(3)} | Lines: ${r.lineIndices} | Matched: ${r.matched}`)
-      if (r.matched) {
-        console.log(`   Window: ${r.matchedLines.length} lines`)
+      console.log(`   Lines: ${r.lineIndices} | Matched: ${r.linesMatched} PDF lines`)
+      if (r.matched && r.matchedLines.length > 0) {
+        r.matchedLines.forEach((line, i) => {
+          console.log(`      Line: "${line.substring(0, 50)}..."`)
+        })
       }
     })
 
@@ -261,9 +294,7 @@ async function testChunk(chunkId) {
     const totalBlocks = results.length
     const matchedBlocks = results.filter(r => r.matched).length
     const matchRate = totalBlocks > 0 ? matchedBlocks / totalBlocks : 0
-    const avgScore = results.length > 0
-      ? results.reduce((sum, r) => sum + r.score, 0) / results.length
-      : 0
+    const totalLinesMatched = results.reduce((sum, r) => sum + r.linesMatched, 0)
 
     const matchedBlocksText = results
       .filter(r => r.matched)
@@ -277,18 +308,17 @@ async function testChunk(chunkId) {
     console.log('📊 QUALITY METRICS')
     console.log('='.repeat(70))
     console.log(`Block Match Rate:  ${matchedBlocks}/${totalBlocks} (${(matchRate * 100).toFixed(1)}%)`)
-    console.log(`Average Score:     ${avgScore.toFixed(3)}`)
+    console.log(`Total Lines:       ${totalLinesMatched} PDF lines highlighted`)
     console.log(`Coverage:          ${(coverage * 100).toFixed(1)}%`)
     console.log('='.repeat(70))
 
-    // Pass/Fail
-    const pass = matchRate >= 0.8 && avgScore >= 0.85 && coverage >= 0.75
+    // Pass/Fail - simplified criteria
+    const pass = matchRate >= 0.8 && coverage >= 0.75
     console.log(`\n${pass ? '✅ PASS' : '❌ FAIL'}`)
 
     if (!pass) {
       console.log('\nFailure reasons:')
       if (matchRate < 0.8) console.log(`  - Match rate too low: ${(matchRate * 100).toFixed(1)}% < 80%`)
-      if (avgScore < 0.85) console.log(`  - Average score too low: ${avgScore.toFixed(3)} < 0.85`)
       if (coverage < 0.75) console.log(`  - Coverage too low: ${(coverage * 100).toFixed(1)}% < 75%`)
     }
 

@@ -80,10 +80,22 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     setPageTextMap(null)
   }, [chunkContext])
 
-  // Calculate fixed scale once on mount to prevent feedback loop
+  // Calculate fixed scale once per PDF document to prevent feedback loop
+  // Scale only depends on PDF dimensions and container width, NOT on chunkContext
   const hasCalculatedScaleRef = useRef(false)
+  const prevPdfDocRef = useRef<any>(null)
   useEffect(() => {
-    if (!pdfDocument || hasCalculatedScaleRef.current) return
+    if (!pdfDocument) return
+
+    // Reset scale calculation flag when PDF document changes
+    if (pdfDocument !== prevPdfDocRef.current) {
+      console.log('[PDF] New PDF document detected, resetting scale calculation')
+      hasCalculatedScaleRef.current = false
+      prevPdfDocRef.current = pdfDocument
+    }
+
+    // Skip if already calculated for this PDF
+    if (hasCalculatedScaleRef.current) return
 
     const calculateScale = async () => {
       try {
@@ -107,11 +119,6 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     calculateScale()
   }, [pdfDocument, containerWidth])
 
-  // Reset scale calculation when chunk changes
-  useEffect(() => {
-    hasCalculatedScaleRef.current = false
-  }, [chunkContext])
-
   useEffect(() => {
     if (!hasCalledReady.current && scale !== null) {
       hasCalledReady.current = true
@@ -119,8 +126,39 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     }
   }, [onReady, scale])
 
-  // Normalization helper
-  const normalizeWithSpaces = useCallback((text: string) => text.toLowerCase().replace(/\s+/g, ' ').trim(), [])
+  // Normalization helper - removes punctuation for better matching
+  const normalizeWithSpaces = useCallback((text: string) => text
+    .toLowerCase()
+    .replace(/[^\w\s]/g, '') // Remove punctuation
+    .replace(/\s+/g, ' ')
+    .trim(), [])
+
+  // Normalization without spaces - for handling "sciencenewst oday" vs "sciencenewstoday"
+  const normalizeNoSpaces = useCallback((text: string) => text
+    .toLowerCase()
+    .replace(/[^\w]/g, ''), [])
+
+  // Word-bag matching for word order differences
+  const wordBagMatch = useCallback((lineText: string, blockText: string): number => {
+    const stopWords = new Set(['the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'was', 'one', 'our', 'out'])
+    const lineWords = lineText.toLowerCase().split(/\s+/).filter(w => w.length > 3 && !stopWords.has(w))
+    const blockWords = blockText.toLowerCase().split(/\s+/).filter(w => w.length > 3 && !stopWords.has(w))
+
+    if (lineWords.length === 0) return 0
+
+    let matchedWords = 0
+    for (const word of lineWords) {
+      const exactMatch = blockWords.includes(word)
+      const substringMatch = blockWords.some((bw) => {
+        const shorter = Math.min(bw.length, word.length)
+        const longer = Math.max(bw.length, word.length)
+        return shorter >= 5 && longer / shorter <= 1.5 && (bw.includes(word) || word.includes(bw))
+      })
+      if (exactMatch || substringMatch) matchedWords++
+    }
+
+    return matchedWords / lineWords.length
+  }, [])
 
   // Levenshtein distance for better similarity matching
   const levenshteinDistance = useCallback((str1: string, str2: string): number => {
@@ -165,16 +203,17 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
       hasRendered: hasRendered.current,
       viewerReady,
       hasHighlighted: hasHighlightedRef.current,
+      hasScrollTo: !!scrollToRef.current,
     })
 
-    // Don't wait for viewerReady - set highlights early so they're ready when textlayerrendered fires
-    if (!isFullyReady || !chunkContext || !pdfDocument || !pageTextMap || !hasRendered.current || hasHighlightedRef.current) return
+    // Wait for viewerReady to ensure scrollTo function is available - needed to trigger textLayer creation
+    if (!isFullyReady || !chunkContext || !pdfDocument || !pageTextMap || !hasRendered.current || !viewerReady || hasHighlightedRef.current) return
 
     console.log('[PDF] ✅ All dependencies ready, starting highlighting...')
     hasHighlightedRef.current = true
 
     const findHighlights = async () => {
-      console.log('[PDF] 🚀 Starting sliding window + Levenshtein matching...')
+      console.log('[PDF] 🚀 Starting SEQUENTIAL PARAGRAPH matching...')
       console.log('[PDF] Chunk context:', chunkContext.substring(0, 200))
 
       try {
@@ -186,86 +225,87 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
           .map(s => s.trim())
           .filter(s => s.length > 10)
 
-        console.log(`[PDF] 📝 ${chunkBlocks.length} chunk blocks to match`)
+        console.log(`[PDF] 📝 ${chunkBlocks.length} chunk blocks to match against ${pageTextMap.lines.length} PDF lines`)
 
         const allMatchedRects: Array<{ x1: number; y1: number; x2: number; y2: number; width: number; height: number; pageNumber: number }> = []
-        const matchResults: Array<{ blockIndex: number; score: number; matched: boolean }> = []
+        const matchResults: Array<{ blockIndex: number; linesMatched: number; matched: boolean }> = []
 
-        // Match each chunk block using sliding window approach
-        for (let i = 0; i < chunkBlocks.length; i++) {
-          const block = chunkBlocks[i]
+        // SEQUENTIAL PARAGRAPH MATCHING: Find ALL lines that belong to each block
+        let lastMatchedLineIdx = -1
+
+        for (let blockIdx = 0; blockIdx < chunkBlocks.length; blockIdx++) {
+          const block = chunkBlocks[blockIdx]
           const blockNormalized = normalizeWithSpaces(block)
 
-          console.log(`[PDF]   Block ${i + 1}: "${block.substring(0, 60)}..."`)
+          console.log(`[PDF]   Block ${blockIdx + 1}: "${block.substring(0, 60)}..."`)
 
-          let bestMatch: { lines: typeof pageTextMap.lines, score: number } | null = null
+          // Find ALL PDF lines whose text appears in this chunk block
+          const matchingLines: Array<{ line: typeof pageTextMap.lines[0]; lineIdx: number }> = []
 
-          // Try windows of 1-5 consecutive PDF lines
-          for (let windowSize = 1; windowSize <= Math.min(5, pageTextMap.lines.length); windowSize++) {
-            for (let startIdx = 0; startIdx <= pageTextMap.lines.length - windowSize; startIdx++) {
-              const windowLines = pageTextMap.lines.slice(startIdx, startIdx + windowSize)
-              const windowText = normalizeWithSpaces(windowLines.map(l => l.text).join(' '))
+          for (let lineIdx = lastMatchedLineIdx + 1; lineIdx < pageTextMap.lines.length; lineIdx++) {
+            const line = pageTextMap.lines[lineIdx]
+            const lineNormalized = normalizeWithSpaces(line.text)
 
-              // Calculate similarity using Levenshtein distance
-              const similarity = calculateLevenshteinSimilarity(blockNormalized, windowText)
+            // Skip very short lines
+            if (lineNormalized.length < 8) continue
 
-              // Check substring in BOTH directions (needed for multi-column PDFs)
-              const isSubstring = windowText.includes(blockNormalized) || blockNormalized.includes(windowText)
+            // Check if this PDF line's text appears in the chunk block
+            const lineInBlock = blockNormalized.includes(lineNormalized)
 
-              let score = isSubstring ? 1.0 : similarity
+            // Also check if block appears in line (for short blocks)
+            const blockInLine = lineNormalized.includes(blockNormalized)
 
-              // Special handling for short blocks (<60 chars): word-bag matching
-              // Helps with headers/titles/URLs where word order may differ
-              if (blockNormalized.length < 60 && score < 0.75) {
-                const blockWords = blockNormalized.split(' ').filter(w => w.length >= 3)
-                const windowWords = windowText.split(' ').filter(w => w.length >= 3)
+            // Check with no spaces (handles "sciencenewst oday" vs "sciencenewstoday")
+            const lineNoSpaces = normalizeNoSpaces(line.text)
+            const blockNoSpaces = normalizeNoSpaces(block)
+            const lineInBlockNoSpaces = blockNoSpaces.includes(lineNoSpaces)
+            const blockInLineNoSpaces = lineNoSpaces.includes(blockNoSpaces)
 
-                // Check if ALL block words exist in window (order-independent)
-                const allWordsPresent = blockWords.length > 0
-                  && blockWords.every(w => windowWords.some(ww => ww.includes(w) || w.includes(ww)))
+            // Word-bag matching (handles word order differences)
+            // Stricter threshold for short blocks to avoid false positives
+            const lengthRatio = Math.max(lineNormalized.length, blockNormalized.length) / Math.min(lineNormalized.length, blockNormalized.length)
+            const wordBagScore = lengthRatio <= 3 ? wordBagMatch(line.text, block) : 0
+            const wordBagThreshold = blockNormalized.length < 60 ? 0.95 : 0.8
 
-                // SAFEGUARD: Window shouldn't be much longer than block (prevent false positives)
-                const lengthRatio = windowText.length / blockNormalized.length
-                const acceptableLength = lengthRatio <= 2.0 // At most 2x longer
+            // Fallback: high Levenshtein similarity
+            const similarity = calculateLevenshteinSimilarity(lineNormalized, blockNormalized)
 
-                if (allWordsPresent && acceptableLength) {
-                  score = 0.85 // Good enough for short blocks
-                  console.log(`[PDF]           (word-bag match for short block, ratio: ${lengthRatio.toFixed(1)}x)`)
-                }
-              }
-
-              if (!bestMatch || score > bestMatch.score)
-                bestMatch = { lines: windowLines, score }
-            }
+            if (lineInBlock || blockInLine || lineInBlockNoSpaces || blockInLineNoSpaces || wordBagScore >= wordBagThreshold || similarity >= 0.75)
+              matchingLines.push({ line, lineIdx })
           }
 
-          // Accept match if score > 0.75
-          const threshold = 0.75
-          if (bestMatch && bestMatch.score >= threshold) {
-            console.log(`[PDF]       ✓ Matched ${bestMatch.lines.length} consecutive lines (score: ${bestMatch.score.toFixed(2)}):`)
+          // Add all matching lines to highlights
+          if (matchingLines.length > 0) {
+            console.log(`[PDF]       ✓ Found ${matchingLines.length} matching lines:`)
 
-            // Create rects from matched lines
-            for (const line of bestMatch.lines) {
-              const lineIdx = pageTextMap.lines.indexOf(line)
-              console.log(`[PDF]           Line ${lineIdx + 1}: "${line.text.substring(0, 60)}..."`)
+            for (const match of matchingLines) {
+              console.log(`[PDF]           Line ${match.lineIdx + 1}: "${match.line.text.substring(0, 50)}..." @ y=${match.line.box.y1.toFixed(0)}`)
 
-              const yOffset = (line.box.y2 - line.box.y1) * 0.15
+              // Add rect for this line
+              const yOffset = (match.line.box.y2 - match.line.box.y1) * 0.15
               allMatchedRects.push({
-                x1: line.box.x1,
-                y1: line.box.y1 - yOffset,
-                x2: line.box.x2,
-                y2: line.box.y2 - yOffset,
-                width: line.box.x2 - line.box.x1,
-                height: line.box.y2 - line.box.y1,
-                pageNumber: line.pageNumber, // Use actual page from line
+                x1: match.line.box.x1,
+                y1: match.line.box.y1 - yOffset,
+                x2: match.line.box.x2,
+                y2: match.line.box.y2 - yOffset,
+                width: match.line.box.x2 - match.line.box.x1,
+                height: match.line.box.y2 - match.line.box.y1,
+                pageNumber: match.line.pageNumber,
               })
+
+              // Update last matched position to maintain sequential order
+              lastMatchedLineIdx = Math.max(lastMatchedLineIdx, match.lineIdx)
             }
 
-            matchResults.push({ blockIndex: i, score: bestMatch.score, matched: true })
+            matchResults.push({
+              blockIndex: blockIdx,
+              linesMatched: matchingLines.length,
+              matched: true,
+            })
           }
           else {
-            console.log(`[PDF]       ✗ No match found (best score: ${bestMatch?.score.toFixed(2) || '0.00'})`)
-            matchResults.push({ blockIndex: i, score: bestMatch?.score || 0, matched: false })
+            console.log('[PDF]       ✗ No matching lines found')
+            matchResults.push({ blockIndex: blockIdx, linesMatched: 0, matched: false })
           }
         }
 
@@ -273,9 +313,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         const totalBlocks = chunkBlocks.length
         const matchedBlocks = matchResults.filter(r => r.matched).length
         const matchRate = totalBlocks > 0 ? matchedBlocks / totalBlocks : 0
-        const avgScore = matchResults.length > 0
-          ? matchResults.reduce((sum, r) => sum + r.score, 0) / matchResults.length
-          : 0
+        const totalLinesMatched = matchResults.reduce((sum, r) => sum + r.linesMatched, 0)
 
         // Calculate character coverage
         const matchedBlocksText = chunkBlocks
@@ -288,7 +326,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         console.log('\n[PDF] 📊 QUALITY METRICS')
         console.log(`[PDF] ${'='.repeat(50)}`)
         console.log(`[PDF] Block Match Rate:  ${matchedBlocks}/${totalBlocks} (${(matchRate * 100).toFixed(1)}%)`)
-        console.log(`[PDF] Average Score:     ${avgScore.toFixed(3)}`)
+        console.log(`[PDF] Total Lines:       ${totalLinesMatched} PDF lines highlighted`)
         console.log(`[PDF] Coverage:          ${(coverageRate * 100).toFixed(1)}% of chunk chars`)
         console.log(`[PDF] Matched Rects:     ${allMatchedRects.length}`)
         console.log(`[PDF] ${'='.repeat(50)}\n`)
@@ -298,7 +336,11 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
           return
         }
 
-        // Create highlight
+        // Use API page number first (from n8n), fallback to first matched rect's page only if needed
+        const matchedPageNumbers = Array.from(new Set(allMatchedRects.map(r => r.pageNumber))).sort((a, b) => a - b)
+        console.log(`[PDF] 📄 API page: ${pageNum}, Matched rects span pages: [${matchedPageNumbers.join(', ')}]`)
+
+        // Create highlight - prioritize API page number
         const boundingRect = {
           x1: Math.min(...allMatchedRects.map(r => r.x1)),
           y1: Math.min(...allMatchedRects.map(r => r.y1)),
@@ -327,7 +369,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
         // Manually scroll to the highlight to trigger textLayer creation on that page
         if (scrollToRef.current) {
-          console.log(`[PDF] 📜 Scrolling to highlight page ${apiPageNumber}...`)
+          console.log(`[PDF] 📜 Scrolling to API page ${pageNum}...`)
           scrollToRef.current(newHighlight)
         }
         else {
@@ -340,7 +382,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     }
 
     findHighlights()
-  }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, pageTextMap, normalizeWithSpaces, calculateLevenshteinSimilarity])
+  }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, pageTextMap, viewerReady, normalizeWithSpaces, normalizeNoSpaces, wordBagMatch, calculateLevenshteinSimilarity])
 
   // Extract full text from ALL API pages WITH positions
   useEffect(() => {
@@ -382,11 +424,10 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
             const x = item.transform[4]
             const y = item.transform[5]
-            const key = `${pageNum}-${x.toFixed(1)},${y.toFixed(1)},${item.str}`
 
             // Check if already added
             const exists = allTextItems.some(t =>
-              t.pageNumber === pageNum && Math.abs(t.x - x) < 1 && Math.abs(t.y - y) < 1 && t.text === item.str
+              t.pageNumber === pageNum && Math.abs(t.x - x) < 1 && Math.abs(t.y - y) < 1 && t.text === item.str,
             )
 
             if (!exists) {
@@ -444,7 +485,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         for (const item of sortedItems) {
           // Find existing line group (within 5px Y AND same page)
           const existingLine = lineGroups.find(line =>
-            line.pageNumber === item.pageNumber && Math.abs(line.y - item.y) < 5
+            line.pageNumber === item.pageNumber && Math.abs(line.y - item.y) < 5,
           )
 
           if (existingLine) {
