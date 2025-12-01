@@ -118,7 +118,10 @@ async function generateEvidenceReport(chunkId) {
     console.log(`  Length: ${chunkContext.length} chars`)
 
     // Extract PDF
-    const pdfFilePath = `/tmp/test-pdfs/${pdfPath.split('/').pop()}`
+    let pdfFileName = pdfPath.split('/').pop()
+    // Map long filenames to simplified ones
+    if (pdfFileName.includes('IM-0065805')) pdfFileName = 'hospital.pdf'
+    const pdfFilePath = `/tmp/test-pdfs/${pdfFileName}`
     const pdfLines = extractRealPDFLines(pdfFilePath, pageNumber)
 
     // Split chunk into blocks
