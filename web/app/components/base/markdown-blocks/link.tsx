@@ -112,14 +112,23 @@ const Link = ({ node, children, ...props }: any) => {
             chunkId: citation.chunkId,
           }
           console.log('✅ Setting previewData:', previewDataObj)
-          setPreviewData(previewDataObj)
+          // Close panel first, then reopen - forces complete remount for fresh state
+          setPreviewData(null)
+          setTimeout(() => {
+            setPreviewData(previewDataObj)
+          }, 50)
         }
         else {
           // Fallback: use link text as source text
-          setPreviewData({
+          const fallbackData = {
             url: href.toString(),
             sourceText: linkText || undefined,
-          })
+          }
+          // Close panel first, then reopen - forces complete remount for fresh state
+          setPreviewData(null)
+          setTimeout(() => {
+            setPreviewData(fallbackData)
+          }, 50)
         }
       }
       return <a href={href} onClick={handlePreviewClick} className={`${commonClassName} text-primary-600`}>{children || 'Preview'}</a>

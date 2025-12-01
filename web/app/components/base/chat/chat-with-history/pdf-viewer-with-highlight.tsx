@@ -39,6 +39,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
   const hasExtractedPagesRef = useRef<Set<number>>(new Set())
   const scrollToRef = useRef<((highlight: IHighlight) => void) | null>(null)
   const [scale, setScale] = useState<string | null>(null)
+  const [scaleReady, setScaleReady] = useState(false) // Track if scale is ready for current chunk
   const [highlights, setHighlights] = useState<IHighlight[]>([])
   const [viewerReady, setViewerReady] = useState(false)
 
@@ -72,33 +73,25 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
 
   // Reset highlights when chunkContext changes (new citation clicked)
   useEffect(() => {
-    console.log('[PDF] ChunkContext changed, resetting highlights')
+    console.log('[PDF] ChunkContext changed, resetting highlights and scale')
     hasHighlightedRef.current = false
     hasExtractedPagesRef.current.clear()
-    setViewerReady(false)
+    // Don't reset viewerReady - it's tied to viewer instance, not chunk
+    // The key={chunkId} handles remounting for different chunks
     setHighlights([])
     setPageTextMap(null)
+    setScaleReady(false) // Force scale recalculation for this chunk
+    setScale(null) // Reset scale to trigger recalculation
   }, [chunkContext])
 
-  // Calculate fixed scale once per PDF document to prevent feedback loop
-  // Scale only depends on PDF dimensions and container width, NOT on chunkContext
-  const hasCalculatedScaleRef = useRef(false)
-  const prevPdfDocRef = useRef<any>(null)
+  // Calculate scale when needed (after reset or on mount)
   useEffect(() => {
-    if (!pdfDocument) return
-
-    // Reset scale calculation flag when PDF document changes
-    if (pdfDocument !== prevPdfDocRef.current) {
-      console.log('[PDF] New PDF document detected, resetting scale calculation')
-      hasCalculatedScaleRef.current = false
-      prevPdfDocRef.current = pdfDocument
-    }
-
-    // Skip if already calculated for this PDF
-    if (hasCalculatedScaleRef.current) return
+    // Only calculate if we have pdfDocument and scale is not ready
+    if (!pdfDocument || scaleReady) return
 
     const calculateScale = async () => {
       try {
+        console.log(`[PDF] 📐 Calculating scale... (container: ${containerWidth}px)`)
         const page = await pdfDocument.getPage(1)
         const viewport = page.getViewport({ scale: 1.0 })
         // Calculate scale to fit width, with margin for scrollbar + padding
@@ -106,18 +99,18 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         // Round DOWN to 2 decimal places to prevent overflow
         const roundedScale = Math.floor(calculatedScale * 100) / 100
         setScale(roundedScale.toString())
-        hasCalculatedScaleRef.current = true
-        console.log(`[PDF] ✅ Scale calculated ONCE: ${roundedScale} (container: ${containerWidth}px, page: ${viewport.width}px)`)
+        setScaleReady(true)
+        console.log(`[PDF] ✅ Scale calculated: ${roundedScale} (container: ${containerWidth}px, page: ${viewport.width}px)`)
       }
       catch {
         console.log('[PDF] Scale calculation failed, using default')
         setScale('1.0')
-        hasCalculatedScaleRef.current = true
+        setScaleReady(true)
       }
     }
 
     calculateScale()
-  }, [pdfDocument, containerWidth])
+  }, [pdfDocument, containerWidth, scaleReady])
 
   useEffect(() => {
     if (!hasCalledReady.current && scale !== null) {
@@ -201,13 +194,15 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
       hasPdfDoc: !!pdfDocument,
       hasPageTextMap: !!pageTextMap,
       hasRendered: hasRendered.current,
+      scaleReady,
       viewerReady,
       hasHighlighted: hasHighlightedRef.current,
       hasScrollTo: !!scrollToRef.current,
     })
 
-    // Wait for viewerReady to ensure scrollTo function is available - needed to trigger textLayer creation
-    if (!isFullyReady || !chunkContext || !pdfDocument || !pageTextMap || !hasRendered.current || !viewerReady || hasHighlightedRef.current) return
+    // Wait for scale to be ready before highlighting - prevents race condition where highlights
+    // are calculated at one scale but PDF renders at a different scale
+    if (!isFullyReady || !chunkContext || !pdfDocument || !pageTextMap || !hasRendered.current || !scaleReady || hasHighlightedRef.current) return
 
     console.log('[PDF] ✅ All dependencies ready, starting highlighting...')
     hasHighlightedRef.current = true
@@ -382,7 +377,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     }
 
     findHighlights()
-  }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, pageTextMap, viewerReady, normalizeWithSpaces, normalizeNoSpaces, wordBagMatch, calculateLevenshteinSimilarity])
+  }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, pageTextMap, scaleReady, normalizeWithSpaces, normalizeNoSpaces, wordBagMatch, calculateLevenshteinSimilarity])
 
   // Extract full text from ALL API pages WITH positions
   useEffect(() => {
@@ -749,6 +744,7 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
         >
           {pdfDocument => (
             <PdfHighlighterStable
+              key={chunkId}
               pdfDocument={pdfDocument}
               onReady={handlePdfReady}
               containerWidth={containerRef.current?.clientWidth || 600}
