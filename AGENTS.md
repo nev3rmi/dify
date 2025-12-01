@@ -96,7 +96,7 @@ pnpm test
 ```bash
 cd web
 
-# Test all chunks (36 text chunks, 88% pass rate validated)
+# Test all chunks in database
 bash scripts/run-full-test-suite.sh
 
 # Detailed evidence for specific chunk
@@ -106,15 +106,13 @@ node scripts/generate-test-evidence.js --chunkId=4
 node scripts/extract-pdf-lines.js --pdf=/path/to/file.pdf --page=1
 ```
 
-**Test data:**
-- 43 chunks in n8n database
-- 3 PDFs in MinIO (n8n-document-ingestion bucket)
-- page37.pdf: Technical doc (single-column)
-- Tropical.pdf: Article (multi-column)
-- hospital.pdf: Medical letter (standard format)
+**Test data sources:**
+- Chunks: n8n API webhook
+- PDFs: MinIO bucket `n8n-document-ingestion`
+- Download PDFs: `mc cp myminio/n8n-document-ingestion/... /tmp/test-pdfs/`
 
-**Expected results:**
-- Pass rate: ≥80% (currently 88.9%)
+**Quality targets:**
+- Pass rate: ≥80%
 - No false positives (only highlight chunk text)
 - Auto-show highlights (no manual click)
 
@@ -181,10 +179,10 @@ scrollToRef.current(newHighlight) // Critical for textLayer creation
 
 ### Performance Notes
 
-- **Validated:** 88.9% success rate on 36 real chunks
-- **Multi-column PDFs:** Handled correctly (bi-directional substring)
-- **Short blocks:** Word-bag matching improves headers/URLs
-- **Known limitation:** Only uses page_numbers[0], not full array
+- **Multi-column PDFs:** Handled via bi-directional substring check
+- **Short blocks:** Word-bag matching for headers/URLs with different word order
+- **Known limitation:** Only extracts page_numbers[0], not all pages in multi-page chunks
+- **Validate changes:** Always run full test suite after modifications
 
 ### Test Evidence Location
 
