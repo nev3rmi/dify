@@ -76,10 +76,14 @@ const KnowledgeModal: FC<KnowledgeModalProps> = ({
         body: JSON.stringify({ project_code: projectKey }),
       })
       const data = await response.json()
-      if (Array.isArray(data))
-        setFiles(data)
-      else
+      if (Array.isArray(data)) {
+        // Filter out .anchor files
+        const filteredFiles = data.filter((file: MinioFile) => !file.Key.includes('.anchor'))
+        setFiles(filteredFiles)
+      }
+      else {
         setFiles([])
+      }
     }
     catch (err) {
       console.error('[KnowledgeModal] Failed to fetch files:', err)
@@ -101,7 +105,7 @@ const KnowledgeModal: FC<KnowledgeModalProps> = ({
     try {
       const formData = new FormData()
       formData.append('project_code', projectKey)
-      formData.append('file', file)
+      formData.append('data', file)
 
       const response = await fetch(PROJECT_UPLOAD_API, {
         method: 'POST',

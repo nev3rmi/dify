@@ -19,7 +19,7 @@ type PdfViewerWithHighlightProps = {
   onFullTextExtracted?: (fullText: string) => void
 }
 
-const CHUNK_API_URL = 'https://n8n.toho.vn/webhook/dbf0d2ae-ec68-4827-bdb7-f5dec29c2b1d'
+const CHUNK_API_URL = process.env.NEXT_PUBLIC_CHUNK_API_URL || 'https://n8n.toho.vn/webhook/ememory/get-raw-chunk'
 
 // PDF renderer component
 type PdfHighlighterStableProps = {
