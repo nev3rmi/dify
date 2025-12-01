@@ -29,13 +29,14 @@ type PdfHighlighterStableProps = {
   chunkContext: string | null
   isFullyReady: boolean
   apiPageNumber: number | null
+  apiPageNumbers: number[]
 }
 
-const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onReady, containerWidth, chunkContext, isFullyReady, apiPageNumber }) => {
+const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onReady, containerWidth, chunkContext, isFullyReady, apiPageNumber, apiPageNumbers }) => {
   const hasCalledReady = useRef(false)
   const hasRendered = useRef(false)
   const hasHighlightedRef = useRef(false)
-  const hasExtractedPageRef = useRef<number | null>(null)
+  const hasExtractedPagesRef = useRef<Set<number>>(new Set())
   const scrollToRef = useRef<((highlight: IHighlight) => void) | null>(null)
   const [scale, setScale] = useState<string | null>(null)
   const [highlights, setHighlights] = useState<IHighlight[]>([])
@@ -44,6 +45,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
   // Page text map with line boxes
   type LineGroup = {
     y: number
+    pageNumber: number
     text: string
     box: { x1: number; y1: number; x2: number; y2: number }
   }
@@ -55,6 +57,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
       y: number
       width: number
       height: number
+      pageNumber: number
     }>
     lines: LineGroup[]
     fullText: string
@@ -71,7 +74,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
   useEffect(() => {
     console.log('[PDF] ChunkContext changed, resetting highlights')
     hasHighlightedRef.current = false
-    hasExtractedPageRef.current = null
+    hasExtractedPagesRef.current.clear()
     setViewerReady(false)
     setHighlights([])
     setPageTextMap(null)
@@ -254,7 +257,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
                 y2: line.box.y2 - yOffset,
                 width: line.box.x2 - line.box.x1,
                 height: line.box.y2 - line.box.y1,
-                pageNumber: pageNum,
+                pageNumber: line.pageNumber, // Use actual page from line
               })
             }
 
@@ -339,49 +342,72 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
     findHighlights()
   }, [isFullyReady, chunkContext, pdfDocument, apiPageNumber, pageTextMap, normalizeWithSpaces, calculateLevenshteinSimilarity])
 
-  // Extract full text from API page WITH positions
+  // Extract full text from ALL API pages WITH positions
   useEffect(() => {
-    if (!apiPageNumber || !pdfDocument || !scale) return
+    if (apiPageNumbers.length === 0 || !pdfDocument || !scale) return
 
-    // Skip if already extracted for this page
-    if (hasExtractedPageRef.current === apiPageNumber) {
-      console.log(`[PDF] ⏭️ Already extracted page ${apiPageNumber}, skipping`)
+    // Check if we've already extracted these exact pages
+    const pagesKey = apiPageNumbers.join(',')
+    const alreadyExtracted = apiPageNumbers.every(p => hasExtractedPagesRef.current.has(p))
+
+    if (alreadyExtracted) {
+      console.log(`[PDF] ⏭️ Already extracted pages [${pagesKey}], skipping`)
       return
     }
 
-    const extractPageText = async () => {
+    const extractMultiPageText = async () => {
       try {
-        console.log(`[PDF] 📄 Extracting text from page ${apiPageNumber}...`)
+        console.log(`[PDF] 📄 Extracting text from pages [${pagesKey}]...`)
 
-        const page = await pdfDocument.getPage(apiPageNumber)
-        const textContent = await page.getTextContent()
-        const items = textContent.items as any[]
+        // Collect all text items from ALL pages
+        const allTextItems: Array<{
+          text: string
+          x: number
+          y: number
+          width: number
+          height: number
+          pageNumber: number
+        }> = []
 
-        console.log(`[PDF] 📄 Page ${apiPageNumber}: ${items.length} text items`)
+        for (const pageNum of apiPageNumbers) {
+          const page = await pdfDocument.getPage(pageNum)
+          const textContent = await page.getTextContent()
+          const items = textContent.items as any[]
 
-        // Store each text item with its position (deduplicate by position)
-        const textItemsMap = new Map<string, typeof textItems[0]>()
+          console.log(`[PDF]   Page ${pageNum}: ${items.length} text items`)
 
-        for (const item of items) {
-          if (!item.str || !item.str.trim()) continue
+          // Deduplicate and add to collection with page number
+          for (const item of items) {
+            if (!item.str || !item.str.trim()) continue
 
-          const x = item.transform[4]
-          const y = item.transform[5]
-          const key = `${x.toFixed(1)},${y.toFixed(1)},${item.str}` // Unique key
+            const x = item.transform[4]
+            const y = item.transform[5]
+            const key = `${pageNum}-${x.toFixed(1)},${y.toFixed(1)},${item.str}`
 
-          // Skip if duplicate at same position
-          if (textItemsMap.has(key)) continue
+            // Check if already added
+            const exists = allTextItems.some(t =>
+              t.pageNumber === pageNum && Math.abs(t.x - x) < 1 && Math.abs(t.y - y) < 1 && t.text === item.str
+            )
 
-          textItemsMap.set(key, {
-            text: item.str,
-            x,
-            y,
-            width: item.width,
-            height: item.height || Math.abs(item.transform[3]),
-          })
+            if (!exists) {
+              allTextItems.push({
+                text: item.str,
+                x,
+                y,
+                width: item.width,
+                height: item.height || Math.abs(item.transform[3]),
+                pageNumber: pageNum,
+              })
+            }
+          }
+
+          // Mark page as extracted
+          hasExtractedPagesRef.current.add(pageNum)
         }
 
-        const textItems = Array.from(textItemsMap.values())
+        console.log(`[PDF] ✅ Extracted ${allTextItems.length} total items from ${apiPageNumbers.length} page(s)`)
+
+        const textItems = allTextItems
 
         // Sort by Y (top to bottom), then X (left to right)
         const sortedItems = [...textItems].sort((a, b) => {
@@ -406,17 +432,20 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
         fullText = fullText.replace(/\b([a-zA-Z])\s+([a-z]+)/g, '$1$2') // Merge split words
         fullText = fullText.replace(/ {2,}/g, ' ').trim()
 
-        // Group text items by line (Y position) to create sentence boxes
+        // Group text items by line (Y position + page number)
         const lineGroups: Array<{
           y: number
+          pageNumber: number
           items: typeof textItems
           text: string
           box: { x1: number; y1: number; x2: number; y2: number }
         }> = []
 
         for (const item of sortedItems) {
-          // Find existing line group (within 5px Y)
-          const existingLine = lineGroups.find(line => Math.abs(line.y - item.y) < 5)
+          // Find existing line group (within 5px Y AND same page)
+          const existingLine = lineGroups.find(line =>
+            line.pageNumber === item.pageNumber && Math.abs(line.y - item.y) < 5
+          )
 
           if (existingLine) {
             existingLine.items.push(item)
@@ -424,6 +453,7 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
           else {
             lineGroups.push({
               y: item.y,
+              pageNumber: item.pageNumber,
               items: [item],
               text: '',
               box: { x1: 0, y1: 0, x2: 0, y2: 0 },
@@ -454,22 +484,21 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
           }
         }
 
-        // Store text map with lines
+        // Store text map with lines (including page numbers)
         const textMap = {
           items: textItems,
-          lines: lineGroups.map(lg => ({ y: lg.y, text: lg.text, box: lg.box })),
+          lines: lineGroups.map(lg => ({ y: lg.y, pageNumber: lg.pageNumber, text: lg.text, box: lg.box })),
           fullText,
         }
 
         setPageTextMap(textMap)
-        hasExtractedPageRef.current = apiPageNumber
 
-        console.log(`[PDF] 📝 Page ${apiPageNumber} text map: ${textItems.length} items, ${lineGroups.length} lines`)
+        console.log(`[PDF] 📝 Pages [${pagesKey}] text map: ${textItems.length} items, ${lineGroups.length} lines`)
         console.log('[PDF] ✅ pageTextMap state updated - this should trigger highlighting now')
-        console.log(`[PDF] 📦 ALL sentence boxes with positions (${lineGroups.length} lines):`)
+        console.log(`[PDF] 📦 ALL sentence boxes with positions (${lineGroups.length} lines from ${apiPageNumbers.length} page(s)):`)
         lineGroups.forEach((line, idx) => {
           const box = line.box
-          console.log(`[PDF]   Line ${idx + 1}: [${box.x1.toFixed(0)},${box.y1.toFixed(0)} → ${box.x2.toFixed(0)},${box.y2.toFixed(0)}]`)
+          console.log(`[PDF]   Line ${idx + 1} (p${line.pageNumber}): [${box.x1.toFixed(0)},${box.y1.toFixed(0)} → ${box.x2.toFixed(0)},${box.y2.toFixed(0)}]`)
           console.log(`[PDF]           "${line.text}"`)
         })
         console.log(`[PDF] 📝 Full text (${fullText.length} chars):`)
@@ -480,8 +509,8 @@ const PdfHighlighterStable: FC<PdfHighlighterStableProps> = ({ pdfDocument, onRe
       }
     }
 
-    extractPageText()
-  }, [apiPageNumber, pdfDocument, scale])
+    extractMultiPageText()
+  }, [apiPageNumbers, pdfDocument, scale])
 
   // Note: When highlights are enabled, PdfHighlighter auto-scrolls to show highlights
   // No manual scrolling needed - the highlight's pageNumber triggers auto-scroll
@@ -567,6 +596,7 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
   const [pdfLoaded, setPdfLoaded] = useState(false)
   const [apiLoaded, setApiLoaded] = useState(false)
   const [fullChunkContext, setFullChunkContext] = useState<string | null>(null)
+  const [apiPageNumbers, setApiPageNumbers] = useState<number[]>([])
   const [apiPageNumber, setApiPageNumber] = useState<number | null>(null)
   const hasFetchedRef = useRef<string | null>(null)
   const onFullTextExtractedRef = useRef(onFullTextExtracted)
@@ -598,6 +628,7 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
 
     setApiLoaded(false)
     setFullChunkContext(null)
+    setApiPageNumbers([])
     setApiPageNumber(null)
     const fetchChunkContext = async () => {
       console.log(`[PDF] Fetching chunk ${chunkId}...`)
@@ -622,8 +653,9 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
               onFullTextExtractedRef.current(chunkText)
           }
           if (data.page_numbers && data.page_numbers.length > 0) {
+            setApiPageNumbers(data.page_numbers)
             setApiPageNumber(data.page_numbers[0])
-            console.log(`[PDF] API page number: ${data.page_numbers[0]}`)
+            console.log(`[PDF] API page numbers: [${data.page_numbers.join(', ')}]`)
           }
         }
       }
@@ -682,6 +714,7 @@ const PdfViewerWithHighlight: FC<PdfViewerWithHighlightProps> = ({
               chunkContext={fullChunkContext}
               isFullyReady={isReady}
               apiPageNumber={apiPageNumber}
+              apiPageNumbers={apiPageNumbers}
             />
           )}
         </PdfLoader>
