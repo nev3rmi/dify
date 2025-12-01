@@ -67,6 +67,7 @@ async function fetchChunkData(chunkId) {
           resolve({
             type: json.type,
             chunkContext,
+            pageNumbers: json.page_numbers || [1],
             pageNumber: json.page_numbers?.[0] || 1,
             projectCode: json.project_code,
             pdfPath: json.metadata?.direct_link,
@@ -80,17 +81,30 @@ async function fetchChunkData(chunkId) {
   })
 }
 
-function extractRealPDFLines(pdfPath, pageNumber) {
+function extractRealPDFLines(pdfPath, pageNumbers) {
   try {
-    const outputPath = `/tmp/pdf-lines-${pdfPath.split('/').pop()}-p${pageNumber}.json`
-    const cmd = `node scripts/extract-pdf-lines.js --pdf="${pdfPath}" --page=${pageNumber} --output="${outputPath}" 2>/dev/null`
-    execSync(cmd)
+    if (pageNumbers.length === 1) {
+      const outputPath = `/tmp/pdf-lines-${pdfPath.split('/').pop()}-p${pageNumbers[0]}.json`
+      const cmd = `node scripts/extract-pdf-lines.js --pdf="${pdfPath}" --page=${pageNumbers[0]} --output="${outputPath}" 2>/dev/null`
+      execSync(cmd)
 
-    if (!fs.existsSync(outputPath))
-      throw new Error(`Failed to extract PDF lines`)
+      if (!fs.existsSync(outputPath))
+        throw new Error(`Failed to extract PDF lines`)
 
-    const data = JSON.parse(fs.readFileSync(outputPath, 'utf8'))
-    return data.lines
+      const data = JSON.parse(fs.readFileSync(outputPath, 'utf8'))
+      return data.lines
+    }
+    else {
+      const outputPath = `/tmp/pdf-multi-lines-p${pageNumbers.join('-')}.json`
+      const cmd = `node scripts/extract-multi-page.js --pdf="${pdfPath}" --pages=${pageNumbers.join(',')} --output="${outputPath}" 2>/dev/null`
+      execSync(cmd)
+
+      if (!fs.existsSync(outputPath))
+        throw new Error(`Failed to extract multi-page PDF lines`)
+
+      const data = JSON.parse(fs.readFileSync(outputPath, 'utf8'))
+      return data.lines
+    }
   }
   catch (error) {
     throw new Error(`Cannot extract PDF: ${error.message}`)
@@ -104,7 +118,7 @@ async function generateEvidenceReport(chunkId) {
 
   try {
     // Fetch chunk
-    const { type, chunkContext, pageNumber, projectCode, pdfPath } = await fetchChunkData(chunkId)
+    const { type, chunkContext, pageNumbers, projectCode, pdfPath } = await fetchChunkData(chunkId)
 
     if (type !== 'text') {
       console.log(`\nSKIPPED: Type is "${type}" (not text)`)
@@ -114,15 +128,15 @@ async function generateEvidenceReport(chunkId) {
     console.log(`\nCHUNK INFO:`)
     console.log(`  Project: ${projectCode}`)
     console.log(`  PDF: ${pdfPath}`)
-    console.log(`  Page: ${pageNumber}`)
+    console.log(`  Pages: [${pageNumbers.join(', ')}]`)
     console.log(`  Length: ${chunkContext.length} chars`)
 
-    // Extract PDF
+    // Extract PDF from ALL pages
     let pdfFileName = pdfPath.split('/').pop()
     // Map long filenames to simplified ones
     if (pdfFileName.includes('IM-0065805')) pdfFileName = 'hospital.pdf'
     const pdfFilePath = `/tmp/test-pdfs/${pdfFileName}`
-    const pdfLines = extractRealPDFLines(pdfFilePath, pageNumber)
+    const pdfLines = extractRealPDFLines(pdfFilePath, pageNumbers)
 
     // Split chunk into blocks
     const chunkBlocks = chunkContext

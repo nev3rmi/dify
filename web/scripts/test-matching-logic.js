@@ -155,6 +155,7 @@ async function fetchChunkData(chunkId) {
           resolve({
             type: json.type,
             chunkContext,
+            pageNumbers: json.page_numbers || [1],
             pageNumber: json.page_numbers?.[0] || 1,
             projectCode: json.project_code,
             pdfPath: json.metadata?.direct_link,
@@ -168,37 +169,45 @@ async function fetchChunkData(chunkId) {
   })
 }
 
-function extractRealPDFLines(pdfPath, pageNumber) {
+function extractRealPDFLines(pdfPath, pageNumbers) {
   console.log(`\n📄 Extracting REAL PDF text using pdfjs-dist...`)
+  console.log(`   Pages: [${pageNumbers.join(', ')}]`)
 
   try {
-    // Call extract-pdf-lines.js to get real PDF text
-    const outputPath = `/tmp/pdf-lines-p${pageNumber}.json`
+    if (pageNumbers.length === 1) {
+      // Single page extraction
+      const outputPath = `/tmp/pdf-lines-p${pageNumbers[0]}.json`
+      const cmd = `node scripts/extract-pdf-lines.js --pdf="${pdfPath}" --page=${pageNumbers[0]} --output="${outputPath}" 2>/dev/null`
+      execSync(cmd)
 
-    const cmd = `node scripts/extract-pdf-lines.js --pdf="${pdfPath}" --page=${pageNumber} --output="${outputPath}" 2>/dev/null`
-    execSync(cmd)
+      if (!fs.existsSync(outputPath))
+        throw new Error(`Failed to extract PDF lines`)
 
-    if (!fs.existsSync(outputPath)) {
-      throw new Error(`Failed to extract PDF lines`)
+      const data = JSON.parse(fs.readFileSync(outputPath, 'utf8'))
+      console.log(`✅ Extracted ${data.lines.length} real PDF lines\n`)
+
+      return data.lines
     }
+    else {
+      // Multi-page extraction
+      const outputPath = `/tmp/pdf-multi-lines-p${pageNumbers.join('-')}.json`
+      const cmd = `node scripts/extract-multi-page.js --pdf="${pdfPath}" --pages=${pageNumbers.join(',')} --output="${outputPath}" 2>/dev/null`
+      execSync(cmd)
 
-    const data = JSON.parse(fs.readFileSync(outputPath, 'utf8'))
-    console.log(`✅ Extracted ${data.lines.length} real PDF lines\n`)
+      if (!fs.existsSync(outputPath))
+        throw new Error(`Failed to extract multi-page PDF lines`)
 
-    return data.lines
+      const data = JSON.parse(fs.readFileSync(outputPath, 'utf8'))
+      console.log(`✅ Extracted ${data.lines.length} real PDF lines from ${pageNumbers.length} pages\n`)
+
+      return data.lines
+    }
   }
   catch (error) {
     console.error(`⚠️  Could not extract real PDF text: ${error.message}`)
     console.log('   Falling back to mock lines\n')
 
-    // Fallback to mock
-    const sentences = chunkContext
-      .replace(/([.!?])\s+/g, '$1\n')
-      .split('\n')
-      .map(s => s.trim())
-      .filter(s => s.length > 0)
-
-    return sentences
+    return []
   }
 }
 
@@ -209,7 +218,7 @@ async function testChunk(chunkId) {
 
   try {
     // Fetch chunk
-    const { type, chunkContext, pageNumber, projectCode, pdfPath } = await fetchChunkData(chunkId)
+    const { type, chunkContext, pageNumbers, pageNumber, projectCode, pdfPath } = await fetchChunkData(chunkId)
 
     if (type !== 'text') {
       console.log(`\n⚠️  Skipping: Chunk type is "${type}" (only text chunks supported)`)
@@ -219,15 +228,15 @@ async function testChunk(chunkId) {
     console.log(`\n📋 Chunk Info:`)
     console.log(`   Project: ${projectCode}`)
     console.log(`   PDF: ${pdfPath}`)
-    console.log(`   Page: ${pageNumber}`)
+    console.log(`   Pages: [${pageNumbers.join(', ')}]`)
     console.log(`   Length: ${chunkContext.length} chars`)
 
-    // Extract REAL PDF lines from actual PDF
+    // Extract REAL PDF lines from actual PDF (all pages)
     let pdfFileName = pdfPath.split('/').pop()
     // Map long filenames to simplified ones
     if (pdfFileName.includes('IM-0065805')) pdfFileName = 'hospital.pdf'
     const pdfFilePath = `/tmp/test-pdfs/${pdfFileName}`
-    const pdfLines = extractRealPDFLines(pdfFilePath, pageNumber)
+    const pdfLines = extractRealPDFLines(pdfFilePath, pageNumbers)
 
     console.log(`\n📄 PDF Lines: ${pdfLines.length}`)
     pdfLines.forEach((line, i) => {
